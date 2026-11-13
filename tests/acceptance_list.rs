@@ -51,7 +51,7 @@ fn expected_test_names(spec: &str) -> Vec<String> {
 /// Criteria implemented in a later step of the current change. Anything
 /// missing that is not listed here fails the test. Must be empty at the end.
 const PLANNED: &[&str] = &[
-    // 0.3.3: room_decide via MCP elicitation and the service-token CLI.
+    // Next: room_decide via MCP elicitation and the service-token CLI.
     "s5d_ac_uc_agentslam_orgs_decide_elicitation",
     "s5d_ac_uc_agentslam_orgs_service_token_cli",
 ];

@@ -114,8 +114,10 @@ async function act(button, path, body, success) {
 
 function appName(clientId) {
   const c = (clientId || "").toLowerCase();
-  if (c.includes("claude")) return "Claude Code";
-  if (c.includes("codex") || c.includes("chatgpt")) return "Codex";
+  if (c.includes("claude-code")) return "Claude Code";
+  if (c.includes("claude")) return "the Claude app";
+  if (c.includes("codex")) return "Codex";
+  if (c.includes("chatgpt")) return "ChatGPT";
   return "an agent app";
 }
 
@@ -143,7 +145,20 @@ function connectSteps() {
       el("span", { class: "cmd-label" }, "Claude Code"),
       copyRow(`claude mcp add --transport http agentslam ${url}`, "Claude Code command"),
       el("span", { class: "cmd-label" }, "Codex"),
-      copyRow(`codex mcp add agentslam --url ${url} && codex mcp login agentslam`, "Codex command"))),
+      copyRow(`codex mcp add agentslam --url ${url} && codex mcp login agentslam`, "Codex command"),
+      el("details", { class: "app-guide" },
+        el("summary", {}, "Claude app: web, desktop and mobile"),
+        el("ol", { class: "guide" },
+          el("li", {}, "On claude.ai open Customize → Connectors, press Add and choose ", el("strong", {}, "Add custom connector"), "."),
+          el("li", {}, "Name it agentslam and paste the address from step 1. Keep the sign-in option ", el("strong", {}, "Use Claude's published identity"), "."),
+          el("li", {}, "Press Connect and sign in with your work account. The connector then appears in Claude Desktop and in the mobile apps too; turn it on in a chat from the tools menu.")),
+        el("p", { class: "help small" }, "Join requests can't be answered from the Claude app: approve them from Claude Code or this page.")),
+      el("details", { class: "app-guide" },
+        el("summary", {}, "ChatGPT"),
+        el("ol", { class: "guide" },
+          el("li", {}, "On chatgpt.com open Plugins, press + and choose ", el("strong", {}, "Add custom MCP server"), "."),
+          el("li", {}, "Paste the address from step 1 and choose OAuth as the authentication."),
+          el("li", {}, "Press Connect and sign in with your work account, then enable agentslam in a chat."))))),
     el("li", {}, el("div", {},
       el("h3", {}, "Sign in and name the agent"),
       el("p", { class: "help" }, "Your browser opens; sign in with your work account and choose a name such as claude-laptop. Then ask your agent: ",

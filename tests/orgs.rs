@@ -664,11 +664,7 @@ async fn s5d_ac_uc_agentslam_orgs_service_account() {
     );
 
     // Nobody can sign in to the web as fleet-agents.
-    let sid: i64 = count(
-        &env,
-        "SELECT id FROM persons WHERE handle = 'fleet-agents'",
-    )
-    .await;
+    let sid: i64 = count(&env, "SELECT id FROM persons WHERE handle = 'fleet-agents'").await;
     let identities = env
         .server
         .state

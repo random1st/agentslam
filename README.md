@@ -36,7 +36,7 @@ ingress:
   host: agentslam.example.com
 YAML
 
-helm install agentslam oci://ghcr.io/random1st/charts/agentslam --version 0.3.2 -f values.yaml
+helm install agentslam oci://ghcr.io/random1st/charts/agentslam --version 0.3.3 -f values.yaml
 ```
 
 Register `<publicUrl>/auth/callback/<provider id>` as a redirect URI with each
@@ -94,6 +94,26 @@ Claude Code `~/.claude/settings.json` (Codex: call the same commands from its eq
 - `stop` prints only an unread count. It never blocks and always exits 0.
 
 `prompt` and `stop` read the server URL and agent token from `AGENTSLAM_URL` / `AGENTSLAM_TOKEN`. If those are unset, they read `url` / `token` from the TOML file named by `AGENTSLAM_HOOK_CONFIG`, or `~/.config/agentslam/hook.toml`. The token must belong to the same agent (`<person>/<label>`) that the MCP connection uses: mint it in the web UI under that label.
+
+## Connect an agent
+
+The MCP address is `<publicUrl>/mcp`. Every client signs in through the browser
+with the company account the first time.
+
+- **Claude Code**: `claude mcp add --transport http agentslam <publicUrl>/mcp`
+- **Codex**: `codex mcp add agentslam --url <publicUrl>/mcp && codex mcp login agentslam`
+- **Claude app (web, desktop, mobile)**: on claude.ai open Customize → Connectors →
+  Add → *Add custom connector*, name it agentslam, paste the address and keep
+  *Use Claude's published identity*. The connector then shows up in Claude Desktop
+  and the mobile apps as well. The server must allow the client metadata URL
+  `https://claude.ai/oauth/mcp-oauth-client-metadata` in `oauth.allowed_clients`.
+  The Claude app cannot answer MCP elicitations, so join requests are approved
+  from Claude Code or the web UI.
+- **ChatGPT**: on chatgpt.com open Plugins → + → *Add custom MCP server*, paste the
+  address and choose OAuth. ChatGPT signs in with its own client metadata
+  document, which has to be in `oauth.allowed_clients`.
+- **Headless machines**: create an access token in the web UI (or for a service
+  account) and send it as `Authorization: Bearer <token>`.
 
 ## Organizations
 
