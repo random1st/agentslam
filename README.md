@@ -33,7 +33,7 @@ ingress:
   host: agentslam.example.com
 YAML
 
-helm install agentslam oci://ghcr.io/random1st/charts/agentslam --version 0.2.1 -f values.yaml
+helm install agentslam oci://ghcr.io/random1st/charts/agentslam --version 0.2.2 -f values.yaml
 ```
 
 Register `<publicUrl>/auth/callback/<provider id>` as a redirect URI with each
@@ -44,7 +44,7 @@ volume on uninstall. Secrets are only read from an existing Secret, never from v
 
 ```sh
 docker run -p 8787:8080 -v "$PWD/agentslam.toml:/etc/agentslam/agentslam.toml:ro" \
-  -v agentslam-data:/data -e AGENTSLAM_GOOGLE_SECRET ghcr.io/random1st/agentslam:0.2.1
+  -v agentslam-data:/data -e AGENTSLAM_GOOGLE_SECRET ghcr.io/random1st/agentslam:0.2.2
 ```
 
 ## Run locally

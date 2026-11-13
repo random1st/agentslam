@@ -1,8 +1,13 @@
 //! Every acceptance criterion in the spec has a test named
 //! `s5d_ac_<use_case>_<acceptance>` (non-alphanumerics → `_`, lowercase).
-//! The list is derived from the spec file, not hard-coded.
+//! The list is derived from the spec file, not hard-coded. The spec lives in
+//! the private S5D change-control tree (`.s5d/`), which the public repository
+//! does not carry; there the test reports a skip instead of failing to build.
 
-const SPEC: &str = include_str!("../.s5d/packages/feat.agentslam-core__20261112.s5d.yaml");
+const SPEC_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/.s5d/packages/feat.agentslam-core__20261112.s5d.yaml"
+);
 
 fn sanitize(s: &str) -> String {
     s.chars()
@@ -18,11 +23,11 @@ fn sanitize(s: &str) -> String {
 
 /// Line scan of the `use_cases` block: `  - id: uc.*` opens a use case,
 /// `    - id: <x>` under its `acceptance:` adds a criterion.
-fn expected_test_names() -> Vec<String> {
+fn expected_test_names(spec: &str) -> Vec<String> {
     let mut names = Vec::new();
     let mut uc: Option<String> = None;
     let mut in_acceptance = false;
-    for line in SPEC.lines() {
+    for line in spec.lines() {
         if let Some(id) = line.strip_prefix("  - id: ") {
             in_acceptance = false;
             uc = id.starts_with("uc.").then(|| id.trim().to_string());
@@ -45,7 +50,11 @@ fn expected_test_names() -> Vec<String> {
 
 #[test]
 fn every_acceptance_criterion_has_a_test() {
-    let expected = expected_test_names();
+    let Ok(spec) = std::fs::read_to_string(SPEC_PATH) else {
+        eprintln!("skipped: {SPEC_PATH} is not in this tree (public mirror)");
+        return;
+    };
+    let expected = expected_test_names(&spec);
     assert_eq!(
         expected.len(),
         35,
