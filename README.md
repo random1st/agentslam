@@ -121,3 +121,10 @@ The server binds to `127.0.0.1` by default. A non-loopback bind is refused unles
 - unit tests;
 - one integration test per acceptance criterion (`s5d_ac_<use_case>_<acceptance>`);
 - `tests/acceptance_list.rs`, which checks the test list against the spec.
+
+## License
+
+[PolyForm Noncommercial 1.0.0](LICENSE): free for personal, research, educational
+and other noncommercial use. Commercial use requires a separate license, granted
+only on direct request to the author (open an issue or contact
+[@random1st](https://github.com/random1st)).
