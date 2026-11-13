@@ -1,6 +1,7 @@
 //! Live room stream over SSE. Access is checked before the stream opens and
-//! re-checked on every relevant event; losing access (removal, deletion)
-//! closes the stream at once (B9).
+//! re-checked on every relevant event and every keep-alive tick: the web
+//! session is read again (expiry, logout, a disabled organization, a revoked
+//! admin flag), then room access. Losing either closes the stream (B9).
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -13,9 +14,9 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::core::{Result, Shared};
-use crate::identity::session::WebUser;
+use crate::identity::session::{WebUser, load_session_by_hash};
 use crate::rooms::notify::Event;
-use crate::rooms::service;
+use crate::rooms::service::{self, Person};
 use crate::web::person;
 
 type Tx = mpsc::Sender<std::result::Result<SseEvent, Infallible>>;
@@ -32,7 +33,8 @@ pub async fn events(
     Path(name): Path<String>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Sse<impl futures::Stream<Item = std::result::Result<SseEvent, Infallible>>>> {
-    let who = person(&user);
+    let mut who = person(&user);
+    let token_hash = user.session.token_hash.clone();
     // Refuse before opening the stream when the person has no access.
     let (room_id, _floor) = service::web_access(&state, who, name.clone()).await?;
     let mut rx = state.hub.subscribe();
@@ -61,6 +63,10 @@ pub async fn events(
                 ev = rx.recv() => ev,
                 _ = tick.tick() => {
                     if tx.is_closed() { return; }
+                    if current_person(&state, &token_hash, who).await.is_none() {
+                        let _ = emit(&tx, "closed", serde_json::json!({"reason": "access_lost"}).to_string()).await;
+                        return;
+                    }
                     continue;
                 }
             };
@@ -76,9 +82,14 @@ pub async fn events(
             if !relevant {
                 continue;
             }
-            if service::web_access(&state, who, name.clone())
-                .await
-                .is_err()
+            let fresh = current_person(&state, &token_hash, who).await;
+            if let Some(p) = fresh {
+                who = p;
+            }
+            if fresh.is_none()
+                || service::web_access(&state, who, name.clone())
+                    .await
+                    .is_err()
             {
                 let _ = emit(
                     &tx,
@@ -107,4 +118,27 @@ pub async fn events(
         }
     });
     Ok(Sse::new(ReceiverStream::new(out)).keep_alive(KeepAlive::default()))
+}
+
+/// The stream's person as the session says now; None when the session expired
+/// or was logged out, the organization was disabled, or the session now
+/// belongs to another person or organization.
+async fn current_person(
+    state: &crate::core::Shared,
+    token_hash: &str,
+    was: Person,
+) -> Option<Person> {
+    let sess = load_session_by_hash(state, token_hash.to_string())
+        .await
+        .ok()
+        .flatten()?;
+    let org = sess.org.as_ref()?;
+    if sess.person_id != Some(was.person_id) || org.id != was.org_id {
+        return None;
+    }
+    Some(Person {
+        person_id: was.person_id,
+        org_id: was.org_id,
+        is_admin: sess.is_admin,
+    })
 }

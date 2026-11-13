@@ -468,10 +468,18 @@ async fn callback(
         Ready(i64),
         NeedsOrg(i64),
         Disabled,
+        OrgChanged,
     }
     let outcome = state
         .db
         .call(move |c| {
+            // B13: an identity stays bound to the organization key it was first
+            // seen with. A different key now (the IdP moved the user, an Okta
+            // org claim changed) never carries the person into the old
+            // organization; the row is left untouched so the refusal sticks.
+            if people::bound_org_key_differs(c, &login)? {
+                return Ok(Outcome::OrgChanged);
+            }
             let ident = people::upsert_identity(c, &login, now)?;
             if let Some(pid) = ident.person_id {
                 return Ok(match orgs::org_of_person(c, pid)? {
@@ -497,6 +505,14 @@ async fn callback(
     let (identity_id, needs_org) = match outcome {
         Ok(Outcome::Ready(id)) => (id, false),
         Ok(Outcome::NeedsOrg(id)) => (id, true),
+        Ok(Outcome::OrgChanged) => {
+            tracing::warn!(provider = %provider.id, "sign-in refused: organization key changed");
+            return signin_error(
+                StatusCode::FORBIDDEN,
+                "Your organization changed",
+                "Your work-account provider now reports a different organization for this account than the one it belongs to here. Ask the people who run this agentslam server to move it.",
+            );
+        }
         Ok(Outcome::Disabled) => {
             return signin_error(
                 StatusCode::FORBIDDEN,

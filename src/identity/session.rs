@@ -79,7 +79,16 @@ pub async fn load_session(state: &Shared, headers: &HeaderMap) -> Result<Option<
     let Some(raw) = read_cookie(headers, SESSION_COOKIE) else {
         return Ok(None);
     };
-    let token_hash = hash(&raw);
+    load_session_by_hash(state, hash(&raw)).await
+}
+
+/// The session for a stored token hash, read fresh: expiry, logout, a disabled
+/// organization and the current admin flag all apply. Long-lived streams call
+/// it again on every event (B9).
+pub async fn load_session_by_hash(
+    state: &Shared,
+    token_hash: String,
+) -> Result<Option<WebSession>> {
     let now = state.clock.now();
     let cfg = state.config.clone();
     state

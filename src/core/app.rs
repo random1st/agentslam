@@ -53,12 +53,13 @@ impl AppState {
             .user_agent(concat!("agentslam/", env!("CARGO_PKG_VERSION")))
             .build()
             .context("build HTTP client")?;
+        let allow_private_hosts = config.allow_insecure_http_for_tests;
         Ok(Arc::new(AppState {
             config: Arc::new(config),
             db,
             clock,
             hub: Hub::default(),
-            oidc: Oidc::default(),
+            oidc: Oidc::new(allow_private_hosts),
             cimd: CimdCache::default(),
             http,
         }))

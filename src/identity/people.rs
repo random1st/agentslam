@@ -62,6 +62,26 @@ fn row_identity(r: &rusqlite::Row<'_>) -> rusqlite::Result<Identity> {
 
 const IDENTITY_COLS: &str = "id, issuer, sub, provider_id, person_id, email, name, group_admin, org_key_kind, org_key_value, org_key_name";
 
+/// B13: does the identity (issuer, sub) already belong to a person while the
+/// organization key stored at its earlier sign-in differs from the one the IdP
+/// reports now? Identities without a person or without a stored key (signed in
+/// before organizations existed) are not bound yet.
+pub fn bound_org_key_differs(conn: &Connection, login: &VerifiedLogin) -> Result<bool> {
+    let row: Option<(Option<i64>, Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT person_id, org_key_kind, org_key_value FROM identities WHERE issuer = ?1 AND sub = ?2",
+            params![login.issuer, login.sub],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    Ok(match row {
+        Some((Some(_), Some(kind), Some(value))) => {
+            kind != login.org.kind || value != login.org.value
+        }
+        _ => false,
+    })
+}
+
 /// Insert or refresh the identity row for (issuer, sub). Never looks at email.
 pub fn upsert_identity(conn: &Connection, login: &VerifiedLogin, now: i64) -> Result<Identity> {
     conn.execute(

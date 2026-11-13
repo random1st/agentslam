@@ -139,7 +139,8 @@ type BackfillRow = (
 /// Startup backfill for rows from before organizations: every person without
 /// an organization joins the one of its verified key (Google: the email
 /// domain of a Workspace identity, whose `hd` was checked at sign-in; Entra:
-/// the tid in the configured issuer), else "default". Rooms follow their
+/// the tid in the configured issuer), else a "default" organization of its
+/// own (one per person, never shared). Rooms follow their
 /// owner. Idempotent; nothing is deleted.
 pub fn backfill(conn: &mut Connection, cfg: &Config, now: i64) -> Result<usize> {
     let tx = conn.transaction()?;
@@ -202,9 +203,12 @@ pub fn backfill(conn: &mut Connection, cfg: &Config, now: i64) -> Result<usize> 
                     ProviderKind::Oidc => None,
                 }
             })
-            .unwrap_or(OrgKey {
+            // No verified key: an organization of its own, never a shared
+            // bucket. Unrelated people must not land in one tenant (and the
+            // first of them must not become admin over the rest).
+            .unwrap_or_else(|| OrgKey {
                 kind: "default".into(),
-                value: "default".into(),
+                value: format!("person-{person_id}"),
                 name: "default".into(),
             });
         let org_id = create_org(&tx, &key, now)?;
@@ -288,7 +292,7 @@ mod tests {
             .call(move |c| {
                 // Pre-organization rows: persons and a room without org_id.
                 c.execute_batch(
-                    "INSERT INTO persons (id, handle, created_at) VALUES (1, 'roman', 0), (2, 'eve', 0), (3, 'lone', 0);
+                    "INSERT INTO persons (id, handle, created_at) VALUES (1, 'roman', 0), (2, 'eve', 0), (3, 'lone', 0), (4, 'ghost', 0);
                      INSERT INTO identities (issuer, sub, provider_id, person_id, email, created_at, last_login_at) VALUES
                        ('https://accounts.google.com', 'g1', 'google', 1, 'roman@example.org', 0, 0),
                        ('https://login.microsoftonline.com/tid-9/v2.0', 'e1', 'entra', 2, 'eve@contoso.com', 0, 0);
@@ -318,20 +322,21 @@ mod tests {
                 };
                 assert_eq!(
                     admins,
-                    vec!["roman".to_string(), "eve".into(), "lone".into()],
+                    vec!["roman".to_string(), "eve".into(), "lone".into(), "ghost".into()],
                     "the earliest person of each migrated organization becomes its admin"
                 );
                 Ok((orgs, room_org, n))
             })
             .await
             .expect("db");
-        assert_eq!(n, 3);
+        assert_eq!(n, 4);
         assert_eq!(
             orgs,
             vec![
                 ("roman".into(), "google_hd".into(), "example.org".into()),
                 ("eve".into(), "entra_tid".into(), "tid-9".into()),
-                ("lone".into(), "default".into(), "default".into()),
+                ("lone".into(), "default".into(), "person-3".into()),
+                ("ghost".into(), "default".into(), "person-4".into()),
             ]
         );
         assert_eq!(room_org, "example.org", "rooms follow their owner");

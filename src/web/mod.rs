@@ -470,10 +470,11 @@ async fn org_add_okta(
     let issuer = req.issuer.trim().trim_end_matches('/').to_string();
     let parsed = url::Url::parse(&issuer)
         .map_err(|_| Error::BadRequest("the Okta address must be a URL".into()))?;
-    if parsed.scheme() != "https" && !state.config.allow_insecure_http_for_tests {
-        return Err(Error::BadRequest(
-            "the Okta address must start with https://".into(),
-        ));
+    if !state.config.allow_insecure_http_for_tests {
+        // SSRF guard: the server later fetches this issuer's discovery and keys.
+        crate::identity::oidc::check_public_https(&parsed)
+            .await
+            .map_err(|e| Error::BadRequest(format!("the Okta address {e}")))?;
     }
     if req.client_id.trim().is_empty() || req.client_secret.is_empty() {
         return Err(Error::BadRequest(

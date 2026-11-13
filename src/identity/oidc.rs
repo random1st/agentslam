@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
@@ -43,22 +44,122 @@ pub enum LoginError {
     Upstream(String),
 }
 
+/// Discovery and JWKS are re-fetched after this long, so a key the provider
+/// retired stops being trusted even when its kid is still known.
+const KEYS_TTL: Duration = Duration::from_secs(3600);
+
+/// When discovery and keys were fetched, and what they were.
+type CachedKeys = (Instant, Discovery, JwkSet);
+
 #[derive(Clone, Default)]
 pub struct Oidc {
-    cache: Arc<RwLock<HashMap<String, (Discovery, JwkSet)>>>,
+    cache: Arc<RwLock<HashMap<String, CachedKeys>>>,
+    /// Tests only (`allow_insecure_http_for_tests`): skip the SSRF guard for
+    /// issuers that organization admins type in, so a local mock IdP works.
+    allow_private_hosts: bool,
+}
+
+/// SSRF guard for an issuer an organization admin typed in (an Okta
+/// connection): https, a DNS name rather than an IP literal, and every address
+/// it resolves to is public. DNS can still change between this check and the
+/// fetch; redirects are off on the shared client, which limits the rest.
+pub async fn check_public_https(url: &url::Url) -> Result<(), String> {
+    if url.scheme() != "https" {
+        return Err("must start with https://".into());
+    }
+    let host = match url.host() {
+        Some(url::Host::Domain(d)) => d.to_ascii_lowercase(),
+        Some(_) => return Err("must be a DNS name, not an IP address".into()),
+        None => return Err("has no host".into()),
+    };
+    let internal = !host.contains('.')
+        || [".local", ".internal", ".localhost", ".lan", ".home.arpa"]
+            .iter()
+            .any(|s| host.ends_with(s));
+    if internal {
+        return Err("must be a public host name".into());
+    }
+    let port = url.port_or_known_default().unwrap_or(443);
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map_err(|_| "cannot be resolved".to_string())?
+        .collect();
+    if addrs.is_empty() {
+        return Err("cannot be resolved".into());
+    }
+    if addrs.iter().any(|a| !is_public_ip(a.ip())) {
+        return Err("resolves to a private address".into());
+    }
+    Ok(())
+}
+
+fn is_public_ip(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v) => {
+            let o = v.octets();
+            !(v.is_private()
+                || v.is_loopback()
+                || v.is_link_local()
+                || v.is_broadcast()
+                || v.is_unspecified()
+                || v.is_documentation()
+                || o[0] == 0
+                || o[0] >= 224
+                || (o[0] == 100 && (o[1] & 0xc0) == 64))
+        }
+        IpAddr::V6(v) => {
+            if let Some(m) = v.to_ipv4_mapped() {
+                return is_public_ip(IpAddr::V4(m));
+            }
+            let s0 = v.segments()[0];
+            !(v.is_loopback()
+                || v.is_unspecified()
+                || v.is_multicast()
+                || (s0 & 0xfe00) == 0xfc00
+                || (s0 & 0xffc0) == 0xfe80)
+        }
+    }
+}
+
+/// Every endpoint of an admin-typed issuer's discovery document must stay on
+/// the issuer's own origin (Okta publishes them there), so the document cannot
+/// point the server at another host.
+fn same_origin(issuer: &str, endpoint: &str) -> bool {
+    match (url::Url::parse(issuer), url::Url::parse(endpoint)) {
+        (Ok(a), Ok(b)) => a.origin() == b.origin(),
+        _ => false,
+    }
 }
 
 impl Oidc {
+    pub fn new(allow_private_hosts: bool) -> Self {
+        Oidc {
+            allow_private_hosts,
+            ..Oidc::default()
+        }
+    }
+
     async fn load(
         &self,
         http: &reqwest::Client,
         provider: &ProviderConfig,
         force: bool,
     ) -> Result<(Discovery, JwkSet), LoginError> {
-        if !force && let Some(v) = self.cache.read().await.get(&provider.id) {
-            return Ok(v.clone());
+        if !force
+            && let Some((at, d, k)) = self.cache.read().await.get(&provider.id)
+            && at.elapsed() < KEYS_TTL
+        {
+            return Ok((d.clone(), k.clone()));
         }
         let issuer = provider.issuer();
+        let guarded = provider.id.starts_with("okta-conn-") && !self.allow_private_hosts;
+        if guarded {
+            let url = url::Url::parse(&issuer).map_err(|e| LoginError::Upstream(e.to_string()))?;
+            check_public_https(&url)
+                .await
+                .map_err(|e| LoginError::Upstream(format!("issuer {e}")))?;
+        }
         let disc: Discovery = http
             .get(format!("{issuer}/.well-known/openid-configuration"))
             .send()
@@ -77,6 +178,19 @@ impl Oidc {
                 disc.issuer
             )));
         }
+        if guarded
+            && ![
+                &disc.authorization_endpoint,
+                &disc.token_endpoint,
+                &disc.jwks_uri,
+            ]
+            .iter()
+            .all(|e| same_origin(&issuer, e))
+        {
+            return Err(LoginError::Upstream(
+                "discovery endpoints must be on the issuer's own host".into(),
+            ));
+        }
         let jwks: JwkSet = http
             .get(&disc.jwks_uri)
             .send()
@@ -86,10 +200,10 @@ impl Oidc {
             .json()
             .await
             .map_err(|e| LoginError::Upstream(format!("jwks: {e}")))?;
-        self.cache
-            .write()
-            .await
-            .insert(provider.id.clone(), (disc.clone(), jwks.clone()));
+        self.cache.write().await.insert(
+            provider.id.clone(),
+            (Instant::now(), disc.clone(), jwks.clone()),
+        );
         Ok((disc, jwks))
     }
 
@@ -390,6 +504,63 @@ pub fn check_company(
                     name: mapped,
                 },
             ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod ssrf_tests {
+    use super::*;
+
+    #[test]
+    fn private_addresses_are_not_public() {
+        for ip in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "::1",
+            "fd00::1",
+            "fe80::1",
+            "::ffff:10.0.0.1",
+        ] {
+            assert!(
+                !is_public_ip(ip.parse().unwrap()),
+                "{ip} must not count as public"
+            );
+        }
+        for ip in ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"] {
+            assert!(is_public_ip(ip.parse().unwrap()), "{ip} is public");
+        }
+    }
+
+    #[test]
+    fn endpoints_must_share_the_issuer_origin() {
+        let iss = "https://acme.okta.com";
+        assert!(same_origin(iss, "https://acme.okta.com/oauth2/v1/token"));
+        assert!(!same_origin(iss, "https://169.254.169.254/latest"));
+        assert!(!same_origin(iss, "http://acme.okta.com/keys"));
+        assert!(!same_origin(iss, "https://acme.okta.com:8443/keys"));
+    }
+
+    #[tokio::test]
+    async fn typed_issuer_must_be_a_public_https_name() {
+        for u in [
+            "http://acme.okta.com",
+            "https://127.0.0.1",
+            "https://[::1]",
+            "https://localhost",
+            "https://agentslam.agentslam.svc.cluster.local",
+            "https://metadata",
+        ] {
+            let url = url::Url::parse(u).unwrap();
+            assert!(
+                check_public_https(&url).await.is_err(),
+                "{u} must be refused"
+            );
         }
     }
 }

@@ -30,6 +30,9 @@ pub enum CimdError {
 }
 
 const MAX_DOC_BYTES: usize = 64 * 1024;
+/// Client metadata documents kept at once (each id is one allowlisted URL or
+/// one Codex install).
+const MAX_CACHE_ENTRIES: usize = 1024;
 
 #[derive(Clone, Default)]
 pub struct CimdCache {
@@ -74,12 +77,19 @@ impl CimdCache {
         if !resp.status().is_success() {
             return Err(CimdError::Fetch(format!("HTTP {}", resp.status())));
         }
-        let body = resp
-            .bytes()
+        // Read at most MAX_DOC_BYTES: stop as soon as the body grows past it
+        // instead of buffering whatever the host sends.
+        let mut resp = resp;
+        let mut body: Vec<u8> = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
             .await
-            .map_err(|e| CimdError::Fetch(e.to_string()))?;
-        if body.len() > MAX_DOC_BYTES {
-            return Err(CimdError::Invalid("document too large".into()));
+            .map_err(|e| CimdError::Fetch(e.to_string()))?
+        {
+            if body.len() + chunk.len() > MAX_DOC_BYTES {
+                return Err(CimdError::Invalid("document too large".into()));
+            }
+            body.extend_from_slice(&chunk);
         }
         let doc: ClientMetadata =
             serde_json::from_slice(&body).map_err(|e| CimdError::Invalid(e.to_string()))?;
@@ -91,10 +101,17 @@ impl CimdCache {
         if doc.redirect_uris.is_empty() {
             return Err(CimdError::Invalid("redirect_uris is empty".into()));
         }
-        self.inner
-            .write()
-            .await
-            .insert(client_id.to_string(), (Instant::now(), doc.clone()));
+        {
+            let mut cache = self.inner.write().await;
+            // Bounded: expired entries go first; past the cap the cache starts over.
+            if cache.len() >= MAX_CACHE_ENTRIES {
+                cache.retain(|_, (at, _)| at.elapsed() < ttl);
+                if cache.len() >= MAX_CACHE_ENTRIES {
+                    cache.clear();
+                }
+            }
+            cache.insert(client_id.to_string(), (Instant::now(), doc.clone()));
+        }
         Ok(doc)
     }
 }

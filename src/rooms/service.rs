@@ -21,6 +21,9 @@ use crate::rooms::notify::Event;
 pub const MAX_TEXT_CHARS: usize = 16_000;
 pub const READ_LIMIT: i64 = 200;
 pub const MAX_WAIT_S: u64 = 50;
+/// At most this many distinct rooms per room_wait (each check reads up to
+/// READ_LIMIT items per room under the one database lock).
+pub const MAX_WAIT_ROOMS: usize = 50;
 pub const REQUEST_EXPIRY_S: i64 = 7 * 86_400;
 pub const MAX_SESSION_LEN: usize = 128;
 pub const MAX_TOPIC_CHARS: usize = 280;
@@ -696,6 +699,18 @@ pub async fn wait(
     timeout_s: u64,
 ) -> Result<WaitResult> {
     let timeout = Duration::from_secs(timeout_s.clamp(1, MAX_WAIT_S));
+    let rooms = rooms.map(|names| {
+        let mut seen = std::collections::HashSet::new();
+        names
+            .into_iter()
+            .filter(|n| seen.insert(n.clone()))
+            .collect::<Vec<_>>()
+    });
+    if rooms.as_ref().is_some_and(|r| r.len() > MAX_WAIT_ROOMS) {
+        return Err(Error::BadRequest(format!(
+            "room_wait takes at most {MAX_WAIT_ROOMS} rooms"
+        )));
+    }
     // Subscribe before the first check so no event between check and wait is lost.
     let mut rx = state.hub.subscribe();
     let agent_id = caller.agent_id;
@@ -760,18 +775,21 @@ pub async fn wait(
                 if caller_for_hash(conn, &token_hash, &res, now)?.is_none() {
                     return Err(Error::Unauthorized);
                 }
+                // One transaction: a failure on a later room rolls back the
+                // cursors already moved, so no item is skipped undelivered.
+                let tx = conn.transaction()?;
                 let mut all = Vec::new();
-                for (room_id, name, attached, cursor) in &snapshot {
-                    let r = room_by_id(conn, org_id, *room_id)?.ok_or(Error::RoomNotFound)?;
-                    let _ = name;
+                for (room_id, _name, attached, cursor) in &snapshot {
+                    let r = room_by_id(&tx, org_id, *room_id)?.ok_or(Error::RoomNotFound)?;
                     let adm =
-                        member_admission(conn, *room_id, agent_id)?.ok_or(Error::NotAMember)?;
-                    let msgs = member_items(conn, &r, agent_id, adm, *cursor, now)?;
+                        member_admission(&tx, *room_id, agent_id)?.ok_or(Error::NotAMember)?;
+                    let msgs = member_items(&tx, &r, agent_id, adm, *cursor, now)?;
                     if let (true, Some(last)) = (*attached, msgs.last()) {
-                        advance_cursor(conn, agent_id, &sk, *room_id, last.seq)?;
+                        advance_cursor(&tx, agent_id, &sk, *room_id, last.seq)?;
                     }
                     all.extend(msgs);
                 }
+                tx.commit()?;
                 if all.is_empty() {
                     Ok(Check::Nothing)
                 } else {
@@ -833,16 +851,18 @@ pub async fn unread(
                 stmt.query_map(params![agent_id, session_key], |r| Ok((r.get(0)?, r.get(1)?)))?
                     .collect::<rusqlite::Result<_>>()?
             };
+            let tx = conn.transaction()?;
             let mut all = Vec::new();
             for (room_id, cursor) in attached {
-                let Some(r) = room_by_id(conn, org_id, room_id)? else { continue };
-                let Some(adm) = member_admission(conn, room_id, agent_id)? else { continue };
-                let msgs = member_items(conn, &r, agent_id, adm, cursor, now)?;
+                let Some(r) = room_by_id(&tx, org_id, room_id)? else { continue };
+                let Some(adm) = member_admission(&tx, room_id, agent_id)? else { continue };
+                let msgs = member_items(&tx, &r, agent_id, adm, cursor, now)?;
                 if advance && let Some(last) = msgs.last() {
-                    advance_cursor(conn, agent_id, &session_key, room_id, last.seq)?;
+                    advance_cursor(&tx, agent_id, &session_key, room_id, last.seq)?;
                 }
                 all.extend(msgs);
             }
+            tx.commit()?;
             Ok(all)
         })
         .await
