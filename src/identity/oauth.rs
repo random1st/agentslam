@@ -15,10 +15,12 @@ use axum::{Json, Router};
 use rusqlite::{OptionalExtension, params};
 use serde_json::json;
 
+use crate::core::config::{ProviderConfig, ProviderKind};
 use crate::core::html::{error_page_action, esc, html_response};
 use crate::core::{Error, Result, Shared};
 use crate::identity::cimd::{CimdError, redirect_allowed};
 use crate::identity::oidc::LoginError;
+use crate::identity::orgs;
 use crate::identity::people;
 use crate::identity::session::{
     self, LOGIN_COOKIE, MaybeSession, WebSession, check_csrf, read_cookie, set_cookie,
@@ -37,6 +39,8 @@ pub fn routes() -> Router<Shared> {
         .route("/token", post(token))
         .route("/login", get(login_page))
         .route("/login/{provider}", get(login_start))
+        .route("/login/okta/{connection}", get(login_okta_connection))
+        .route("/org/create", get(org_create_page).post(org_create_submit))
         .route("/auth/callback/{provider}", get(callback))
         .route("/consent", get(consent_page).post(consent_submit))
         .route("/logout", post(logout))
@@ -194,6 +198,7 @@ async fn authorize(
     }
     let next = match sess {
         Some(s) if s.person_id.is_some() => format!("/consent?req={req_id}"),
+        Some(s) if s.identity.org_key.is_some() => format!("/org/create?req={req_id}"),
         // Signed out (or a session from before handles were derived): sign in;
         // the callback creates the person and continues to consent.
         _ => format!("/login?req={req_id}"),
@@ -265,7 +270,7 @@ async fn login_start(
     Path(provider_id): Path<String>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let Some(provider) = state.config.provider(&provider_id).cloned() else {
+    let Some((provider, _)) = resolve_provider(&state, &provider_id).await else {
         return signin_error(
             StatusCode::NOT_FOUND,
             "This sign-in option doesn't exist",
@@ -346,7 +351,7 @@ async fn callback(
     headers: HeaderMap,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let Some(provider) = state.config.provider(&provider_id).cloned() else {
+    let Some((provider, forced_org)) = resolve_provider(&state, &provider_id).await else {
         return signin_error(
             StatusCode::NOT_FOUND,
             "This sign-in option doesn't exist",
@@ -418,6 +423,13 @@ async fn callback(
         .await
     {
         Ok(l) => l,
+        Err(LoginError::NoCompanyAccount) => {
+            return signin_error(
+                StatusCode::FORBIDDEN,
+                "A company account is needed",
+                "You signed in with a personal Google account. agentslam is for teams: sign in with the Google Workspace account your company manages.",
+            );
+        }
         Err(LoginError::DomainNotAllowed) => {
             return signin_error(
                 StatusCode::FORBIDDEN,
@@ -444,26 +456,65 @@ async fn callback(
             );
         }
     };
-    let identity = match state
+    // B13 instance restrictions: refused before anything is stored.
+    if forced_org.is_none() && !orgs::instance_allows(&state.config, &login.org) {
+        return signin_error(
+            StatusCode::FORBIDDEN,
+            "Your organization can't use this server",
+            "This agentslam server only accepts certain organizations, and yours is not one of them. Ask the person who runs it.",
+        );
+    }
+    enum Outcome {
+        Ready(i64),
+        NeedsOrg(i64),
+        Disabled,
+    }
+    let outcome = state
         .db
         .call(move |c| {
             let ident = people::upsert_identity(c, &login, now)?;
-            // B1: the person (and its name) is derived at first sign-in; no page asks for it.
-            people::ensure_person(c, ident.id, now)?;
-            Ok(ident)
+            if let Some(pid) = ident.person_id {
+                return Ok(match orgs::org_of_person(c, pid)? {
+                    Some(o) if o.disabled => Outcome::Disabled,
+                    _ => Outcome::Ready(ident.id),
+                });
+            }
+            let org = match forced_org {
+                Some(id) => orgs::org_by_id(c, id)?,
+                None => orgs::find_org(c, &login.org)?,
+            };
+            match org {
+                Some(o) if o.disabled => Ok(Outcome::Disabled),
+                Some(o) => {
+                    // B1/B13: joins the existing organization, name derived, nothing asked.
+                    people::ensure_person(c, ident.id, o.id, now)?;
+                    Ok(Outcome::Ready(ident.id))
+                }
+                None => Ok(Outcome::NeedsOrg(ident.id)),
+            }
         })
-        .await
-    {
-        Ok(i) => i,
+        .await;
+    let (identity_id, needs_org) = match outcome {
+        Ok(Outcome::Ready(id)) => (id, false),
+        Ok(Outcome::NeedsOrg(id)) => (id, true),
+        Ok(Outcome::Disabled) => {
+            return signin_error(
+                StatusCode::FORBIDDEN,
+                "Your organization is disabled",
+                "The people who run this agentslam server have disabled your organization. Ask them if you think this is a mistake.",
+            );
+        }
         Err(e) => return e.into_response(),
     };
-    let cookie = match session::create_session(&state, identity.id).await {
+    let cookie = match session::create_session(&state, identity_id).await {
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
-    let next = match oauth_req {
-        Some(r) => format!("/consent?req={r}"),
-        None => "/".to_string(),
+    let suffix = oauth_req.map(|r| format!("?req={r}")).unwrap_or_default();
+    let next = match (needs_org, suffix.is_empty()) {
+        (true, _) => format!("/org/create{suffix}"),
+        (false, false) => format!("/consent{suffix}"),
+        (false, true) => "/".to_string(),
     };
     let mut resp = Redirect::to(&next).into_response();
     resp.headers_mut().append(header::SET_COOKIE, cookie);
@@ -477,6 +528,163 @@ async fn callback(
 /// Sign-in error page: plain cause plus one next step.
 fn signin_error(status: StatusCode, title: &str, message: &str) -> Response {
     error_page_action(status, title, message, "/login", "Sign in again")
+}
+
+/// A configured provider, or an Okta connection added by an org admin
+/// (`okta-conn-<id>`, B13) together with the organization it signs people into.
+async fn resolve_provider(state: &Shared, id: &str) -> Option<(ProviderConfig, Option<i64>)> {
+    if let Some(p) = state.config.provider(id) {
+        return Some((p.clone(), None));
+    }
+    let conn_id: i64 = id.strip_prefix("okta-conn-")?.parse().ok()?;
+    let key = state.config.secret_key?;
+    let row: Option<(i64, String, String, String)> = state
+        .db
+        .call(move |c| {
+            Ok(c.query_row(
+                "SELECT k.org_id, k.issuer, k.client_id, k.secret_enc FROM okta_connections k
+                 JOIN organizations o ON o.id = k.org_id AND o.disabled_at IS NULL WHERE k.id = ?1",
+                [conn_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?)
+        })
+        .await
+        .ok()
+        .flatten();
+    let (org_id, issuer, client_id, enc) = row?;
+    let secret = orgs::decrypt_secret(&key, &enc).ok()?;
+    Some((
+        ProviderConfig {
+            id: id.to_string(),
+            kind: ProviderKind::Okta,
+            display_name: Some("Okta".into()),
+            issuer: Some(issuer),
+            client_id,
+            client_secret_env: None,
+            client_secret: Some(secret),
+            allowed_domains: vec![],
+            required_group: None,
+            tenant_id: None,
+            groups_claim: "groups".into(),
+            admin_group: None,
+            org_claim: None,
+            org_map: Default::default(),
+        },
+        Some(org_id),
+    ))
+}
+
+/// `/login/okta/{connection}`: sign in through an organization's Okta.
+async fn login_okta_connection(
+    Path(connection): Path<i64>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let mut to = format!("/login/okta-conn-{connection}");
+    if let Some(r) = q.get("req").filter(|r| !r.is_empty()) {
+        to.push_str(&format!("?req={r}"));
+    }
+    Redirect::to(&to).into_response()
+}
+
+/// "Create the organization for <name>" (B13): first person of a domain,
+/// tenant or claim value; they become its first admin.
+async fn org_create_page(
+    MaybeSession(sess): MaybeSession,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let req = q.get("req").cloned().unwrap_or_default();
+    let next = if req.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/consent?req={req}")
+    };
+    let Some(sess) = sess else {
+        return Redirect::to("/login").into_response();
+    };
+    if sess.person_id.is_some() {
+        return Redirect::to(&next).into_response();
+    }
+    let Some(key) = sess.identity.org_key.clone() else {
+        return Redirect::to("/login").into_response();
+    };
+    let name = esc(&key.name);
+    let body = format!(
+        "<p class=\"lead\">Nobody from <strong>{name}</strong> uses agentslam yet.</p>\
+         <p>Create the organization to start. You become its first admin: you can name more admins and connect your company's sign-in later. \
+         People who sign in with a {name} account afterwards join it automatically. Nothing in it is visible to any other organization.</p>\
+         <form method=\"post\" action=\"/org/create\" class=\"actions\">\
+           <input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">\
+           <input type=\"hidden\" name=\"req\" value=\"{req}\">\
+           <button type=\"submit\" class=\"primary\">Create the organization for {name}</button>\
+         </form>\
+         <form method=\"post\" action=\"/logout\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">\
+           <button type=\"submit\" class=\"link-button\">Use a different account</button></form>",
+        csrf = esc(&sess.csrf),
+        req = esc(&req),
+    );
+    html_response(
+        StatusCode::OK,
+        &format!("Create the organization for {}", key.name),
+        &body,
+    )
+}
+
+async fn org_create_submit(
+    State(state): State<Shared>,
+    MaybeSession(sess): MaybeSession,
+    headers: HeaderMap,
+    Form(f): Form<HashMap<String, String>>,
+) -> Response {
+    let Some(sess) = sess else {
+        return Error::Unauthorized.into_response();
+    };
+    if let Err(e) = check_csrf(&sess, &headers, f.get("csrf").map(String::as_str)) {
+        return e.into_response();
+    }
+    let req = f.get("req").cloned().unwrap_or_default();
+    let next = if req.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/consent?req={req}")
+    };
+    if sess.person_id.is_some() {
+        return Redirect::to(&next).into_response();
+    }
+    let Some(key) = sess.identity.org_key.clone() else {
+        return Redirect::to("/login").into_response();
+    };
+    if !orgs::instance_allows(&state.config, &key) {
+        return signin_error(
+            StatusCode::FORBIDDEN,
+            "Your organization can't use this server",
+            "This agentslam server only accepts certain organizations, and yours is not one of them.",
+        );
+    }
+    let identity_id = sess.identity.id;
+    let now = state.clock.now();
+    let created = state
+        .db
+        .call(move |c| {
+            // If someone else created it meanwhile, join instead (no second admin by race).
+            let (org_id, fresh) = match orgs::find_org(c, &key)? {
+                Some(o) if o.disabled => {
+                    return Err(Error::Forbidden("organization disabled".into()));
+                }
+                Some(o) => (o.id, false),
+                None => (orgs::create_org(c, &key, now)?, true),
+            };
+            let pid = people::ensure_person(c, identity_id, org_id, now)?;
+            if fresh {
+                orgs::add_admin(c, org_id, pid, now)?;
+            }
+            Ok(())
+        })
+        .await;
+    match created {
+        Ok(()) => Redirect::to(&next).into_response(),
+        Err(e) => e.into_response(),
+    }
 }
 
 fn capitalize(s: &str) -> String {

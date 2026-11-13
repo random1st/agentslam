@@ -35,6 +35,54 @@ pub struct Config {
     /// Admins by upstream identity (issuer, sub).
     #[serde(default)]
     pub admins: Vec<AdminIdentity>,
+    /// Agent-written room summaries (B6a): how often the server asks for one.
+    #[serde(default)]
+    pub summary: SummaryConfig,
+    /// Instance restriction: Google Workspace domains that may register or
+    /// sign in. Empty = open.
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
+    /// Instance restriction: Entra tenant ids that may register or sign in. Empty = open.
+    #[serde(default)]
+    pub allowed_tenants: Vec<String>,
+    /// AES-256-GCM key for stored Okta client secrets, from env
+    /// AGENTSLAM_SECRET_KEY (32 bytes, base64). Never in the file.
+    #[serde(skip)]
+    pub secret_key: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SummaryConfig {
+    /// Timer period in seconds.
+    #[serde(default = "default_summary_interval")]
+    pub interval_s: u64,
+    /// Messages since the last summary needed before a request is posted.
+    #[serde(default = "default_summary_min_messages")]
+    pub min_messages: i64,
+    /// How long a summary request stays open.
+    #[serde(default = "default_summary_request_ttl")]
+    pub request_ttl_s: i64,
+}
+
+impl Default for SummaryConfig {
+    fn default() -> Self {
+        SummaryConfig {
+            interval_s: default_summary_interval(),
+            min_messages: default_summary_min_messages(),
+            request_ttl_s: default_summary_request_ttl(),
+        }
+    }
+}
+
+fn default_summary_interval() -> u64 {
+    21_600
+}
+fn default_summary_min_messages() -> i64 {
+    20
+}
+fn default_summary_request_ttl() -> i64 {
+    3600
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -43,6 +91,8 @@ pub enum ProviderKind {
     Google,
     Okta,
     Entra,
+    /// Generic OIDC: organization from `org_claim` (or `org_map`).
+    Oidc,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -80,6 +130,12 @@ pub struct ProviderConfig {
     /// okta/entra: members of this group are admins.
     #[serde(default)]
     pub admin_group: Option<String>,
+    /// oidc: ID token claim whose value names the organization (e.g. `org_id`).
+    #[serde(default)]
+    pub org_claim: Option<String>,
+    /// oidc: optional explicit map claim value → organization key.
+    #[serde(default)]
+    pub org_map: std::collections::BTreeMap<String, String>,
 }
 
 impl ProviderConfig {
@@ -87,12 +143,17 @@ impl ProviderConfig {
         match (&self.issuer, self.kind) {
             (Some(i), _) => i.trim_end_matches('/').to_string(),
             (None, ProviderKind::Google) => "https://accounts.google.com".to_string(),
-            (None, ProviderKind::Entra) => format!(
-                "https://login.microsoftonline.com/{}/v2.0",
-                self.tenant_id.as_deref().unwrap_or_default()
-            ),
-            (None, ProviderKind::Okta) => String::new(),
+            (None, ProviderKind::Entra) => match self.tenant_id.as_deref() {
+                Some(t) if !t.is_empty() => format!("https://login.microsoftonline.com/{t}/v2.0"),
+                _ => "https://login.microsoftonline.com/organizations/v2.0".to_string(),
+            },
+            (None, ProviderKind::Okta | ProviderKind::Oidc) => String::new(),
         }
+    }
+
+    /// Entra without tenant_id: one multi-tenant app, issuer checked per tid.
+    pub fn multi_tenant(&self) -> bool {
+        self.kind == ProviderKind::Entra && self.tenant_id.as_deref().is_none_or(str::is_empty)
     }
 
     pub fn label(&self) -> String {
@@ -102,6 +163,7 @@ impl ProviderConfig {
                 ProviderKind::Google => "Google Workspace".to_string(),
                 ProviderKind::Okta => "Okta".to_string(),
                 ProviderKind::Entra => "Microsoft Entra ID".to_string(),
+                ProviderKind::Oidc => "your company account".to_string(),
             })
     }
 }
@@ -190,6 +252,18 @@ impl Config {
     }
 
     pub fn resolve_secrets_from_env(&mut self) -> anyhow::Result<()> {
+        if self.secret_key.is_none()
+            && let Ok(b64) = std::env::var("AGENTSLAM_SECRET_KEY")
+        {
+            use base64::Engine;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(b64.trim())
+                .context("AGENTSLAM_SECRET_KEY is not valid base64")?;
+            let key: [u8; 32] = bytes.try_into().map_err(|_| {
+                anyhow::anyhow!("AGENTSLAM_SECRET_KEY must decode to exactly 32 bytes")
+            })?;
+            self.secret_key = Some(key);
+        }
         for p in &mut self.providers {
             if p.client_secret.is_some() {
                 continue;
@@ -243,21 +317,28 @@ impl Config {
                 p.id
             );
             match p.kind {
-                ProviderKind::Google => ensure!(
-                    !p.allowed_domains.is_empty(),
-                    "provider {} (google): allowed_domains must list at least one hd value",
-                    p.id
-                ),
+                // google: an empty allowed_domains means any Workspace domain
+                // (the instance-level allowed_domains still applies).
+                ProviderKind::Google => {}
                 ProviderKind::Okta => ensure!(
                     p.issuer.as_deref().is_some_and(|i| !i.is_empty()),
                     "provider {} (okta): issuer (the org issuer URL) is required",
                     p.id
                 ),
-                ProviderKind::Entra => ensure!(
-                    p.tenant_id.as_deref().is_some_and(|t| !t.is_empty()),
-                    "provider {} (entra): tenant_id is required",
-                    p.id
-                ),
+                // entra: no tenant_id = one multi-tenant app; the organization is the tid.
+                ProviderKind::Entra => {}
+                ProviderKind::Oidc => {
+                    ensure!(
+                        p.issuer.as_deref().is_some_and(|i| !i.is_empty()),
+                        "provider {} (oidc): issuer is required",
+                        p.id
+                    );
+                    ensure!(
+                        p.org_claim.as_deref().is_some_and(|c| !c.is_empty()),
+                        "provider {} (oidc): org_claim is required (the ID token claim naming the organization)",
+                        p.id
+                    );
+                }
             }
             let issuer = url::Url::parse(&p.issuer())
                 .with_context(|| format!("provider {}: issuer is not a URL", p.id))?;
@@ -279,6 +360,18 @@ impl Config {
         ensure!(
             self.oauth.code_ttl_s > 0 && self.oauth.code_ttl_s <= 600,
             "oauth.code_ttl_s must be 1..600"
+        );
+        ensure!(
+            self.summary.interval_s >= 60,
+            "summary.interval_s must be at least 60"
+        );
+        ensure!(
+            self.summary.min_messages >= 1,
+            "summary.min_messages must be at least 1"
+        );
+        ensure!(
+            self.summary.request_ttl_s >= 60,
+            "summary.request_ttl_s must be at least 60"
         );
         Ok(())
     }

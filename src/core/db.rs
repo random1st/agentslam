@@ -17,6 +17,8 @@ use crate::core::error::{Error, Result};
 const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/0001_init.sql"),
     include_str!("../../migrations/0002_drop_hook_session_key.sql"),
+    include_str!("../../migrations/0003_room_summaries.sql"),
+    include_str!("../../migrations/0004_organizations.sql"),
 ];
 
 #[derive(Clone)]
@@ -26,7 +28,8 @@ pub struct Db {
 
 impl Db {
     /// Open (or create) the database at `path` (`:memory:` for tests), enable
-    /// WAL and foreign keys, and apply pending migrations.
+    /// WAL, apply pending migrations with foreign keys off (table rebuilds need
+    /// it), verify foreign keys, then enable them.
     pub fn open(path: &str) -> anyhow::Result<Db> {
         let mut conn = if path == ":memory:" {
             Connection::open_in_memory()
@@ -36,13 +39,34 @@ impl Db {
         .with_context(|| format!("open sqlite database {path}"))?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .context("enable WAL")?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.pragma_update(None, "foreign_keys", "OFF")?;
+        migrate(&mut conn)?;
+        let violations: i64 =
+            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })?;
+        anyhow::ensure!(
+            violations == 0,
+            "database has {violations} foreign key violations after migration"
+        );
         conn.pragma_update(None, "foreign_keys", "ON")
             .context("enable foreign keys")?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        migrate(&mut conn)?;
         Ok(Db {
             conn: Arc::new(Mutex::new(conn)),
         })
+    }
+
+    /// Run `f` on the calling thread (startup only, before the runtime serves requests).
+    pub fn blocking<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut Connection) -> Result<T>,
+    {
+        let mut guard = self
+            .conn
+            .lock()
+            .map_err(|_| Error::Internal(anyhow::anyhow!("database mutex poisoned")))?;
+        f(&mut guard)
     }
 
     /// Run `f` with exclusive access to the connection on the blocking pool.

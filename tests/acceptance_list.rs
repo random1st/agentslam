@@ -48,6 +48,10 @@ fn expected_test_names(spec: &str) -> Vec<String> {
     names
 }
 
+/// Criteria implemented in a later step of the current change. Anything
+/// missing that is not listed here fails the test. Must be empty at the end.
+const PLANNED: &[&str] = &[];
+
 #[test]
 fn every_acceptance_criterion_has_a_test() {
     let Ok(spec) = std::fs::read_to_string(SPEC_PATH) else {
@@ -57,20 +61,36 @@ fn every_acceptance_criterion_has_a_test() {
     let expected = expected_test_names(&spec);
     assert_eq!(
         expected.len(),
-        35,
+        47,
         "spec acceptance count changed: {expected:?}"
     );
+    for p in PLANNED {
+        assert!(
+            expected.iter().any(|e| e == p),
+            "planned {p} is not in the spec"
+        );
+    }
     let sources = [
         include_str!("connect.rs"),
         include_str!("rooms.rs"),
         include_str!("messaging.rs"),
         include_str!("sessions.rs"),
         include_str!("web.rs"),
+        include_str!("orgs.rs"),
     ]
     .concat();
     let missing: Vec<&String> = expected
         .iter()
         .filter(|n| !sources.contains(&format!("async fn {n}()")))
+        .filter(|n| !PLANNED.contains(&n.as_str()))
         .collect();
     assert!(missing.is_empty(), "acceptance tests missing: {missing:?}");
+    let done_but_planned: Vec<&&str> = PLANNED
+        .iter()
+        .filter(|p| sources.contains(&format!("async fn {p}()")))
+        .collect();
+    assert!(
+        done_but_planned.is_empty(),
+        "remove from PLANNED, now implemented: {done_but_planned:?}"
+    );
 }

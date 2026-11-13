@@ -17,6 +17,7 @@ use serde_json::Value;
 use tokio::sync::RwLock;
 
 use crate::core::config::{ProviderConfig, ProviderKind};
+use crate::identity::orgs::OrgKey;
 use crate::identity::people::VerifiedLogin;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -29,10 +30,13 @@ pub struct Discovery {
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoginError {
-    /// Google account whose `hd` is missing or not allowlisted.
+    /// Google account whose `hd` is not allowlisted (provider or instance).
     #[error("your account's domain is not allowed to sign in here")]
     DomainNotAllowed,
-    /// Okta group / Entra tenant check failed.
+    /// Google account without `hd`: a personal account, not a company one.
+    #[error("a company account is needed")]
+    NoCompanyAccount,
+    /// Okta group / Entra tenant / OIDC org claim check failed.
     #[error("access denied: {0}")]
     AccessDenied(String),
     #[error("sign-in with the identity provider failed: {0}")]
@@ -64,7 +68,10 @@ impl Oidc {
             .json()
             .await
             .map_err(|e| LoginError::Upstream(format!("discovery: {e}")))?;
-        if disc.issuer.trim_end_matches('/') != issuer {
+        // Multi-tenant Entra discovery publishes a templated issuer
+        // (".../{tenantid}/v2.0"); the token issuer is then checked per tid.
+        let templated = provider.multi_tenant() && disc.issuer.contains("{tenantid}");
+        if !templated && disc.issuer.trim_end_matches('/') != issuer {
             return Err(LoginError::Upstream(format!(
                 "discovery issuer {} does not equal configured issuer {issuer}",
                 disc.issuer
@@ -158,14 +165,24 @@ impl Oidc {
         let claims = self
             .verify_id_token(http, provider, id_token, nonce)
             .await?;
-        let group_admin = check_company(provider, &claims)?;
+        let (group_admin, org) = check_company(provider, &claims)?;
         let sub = claims
             .get("sub")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| LoginError::Upstream("ID token has no sub".into()))?;
+        // Multi-tenant: key identities by the per-tenant issuer from the token.
+        let issuer = if provider.multi_tenant() {
+            claims
+                .get("iss")
+                .and_then(Value::as_str)
+                .map(|s| s.trim_end_matches('/').to_string())
+                .unwrap_or_else(|| provider.issuer())
+        } else {
+            provider.issuer()
+        };
         Ok(VerifiedLogin {
-            issuer: provider.issuer(),
+            issuer,
             sub: sub.to_string(),
             provider_id: provider.id.clone(),
             email: claims
@@ -177,6 +194,7 @@ impl Oidc {
                 .and_then(Value::as_str)
                 .map(str::to_string),
             group_admin,
+            org,
         })
     }
 
@@ -202,7 +220,7 @@ impl Oidc {
             ));
         }
         let kid = header.kid.clone().unwrap_or_default();
-        let (_, mut jwks) = self.load(http, provider, false).await?;
+        let (disc, mut jwks) = self.load(http, provider, false).await?;
         if jwks.find(&kid).is_none() {
             // Key rotation: refetch once.
             jwks = self.load(http, provider, true).await?.1;
@@ -218,6 +236,17 @@ impl Oidc {
         let mut issuers = vec![issuer.clone()];
         if provider.kind == ProviderKind::Google && issuer == "https://accounts.google.com" {
             issuers.push("accounts.google.com".to_string());
+        }
+        if provider.multi_tenant() && disc.issuer.contains("{tenantid}") {
+            // Expected issuer = https://login.microsoftonline.com/{tid}/v2.0 for
+            // the token's own tid (signature still verified below).
+            let tid = unverified_claim(id_token, "tid").ok_or_else(|| {
+                LoginError::AccessDenied("your Microsoft account has no tenant".into())
+            })?;
+            if !tid.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+                return Err(LoginError::Upstream("ID token tid is malformed".into()));
+            }
+            issuers = vec![disc.issuer.replace("{tenantid}", &tid)];
         }
         validation.set_issuer(&issuers);
         validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
@@ -244,21 +273,53 @@ fn groups(claims: &Value, claim: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Provider-kind company check on verified claims. Returns whether the
-/// identity is an admin through the provider's admin group.
-pub fn check_company(provider: &ProviderConfig, claims: &Value) -> Result<bool, LoginError> {
+/// Read one string claim from a JWT payload WITHOUT verifying it. Used only
+/// to choose the expected issuer before the signature check.
+fn unverified_claim(token: &str, claim: &str) -> Option<String> {
+    use base64::Engine;
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .ok()?;
+    let v: Value = serde_json::from_slice(&bytes).ok()?;
+    v.get(claim).and_then(Value::as_str).map(str::to_string)
+}
+
+/// Provider-kind company check on verified claims (B13). Returns whether the
+/// identity is an admin through the provider's admin group, and the verified
+/// organization key.
+pub fn check_company(
+    provider: &ProviderConfig,
+    claims: &Value,
+) -> Result<(bool, OrgKey), LoginError> {
+    let email_domain = claims
+        .get("email")
+        .and_then(Value::as_str)
+        .and_then(|e| e.rsplit_once('@'))
+        .map(|(_, d)| d.to_lowercase());
     match provider.kind {
         ProviderKind::Google => {
             let hd = claims.get("hd").and_then(Value::as_str).unwrap_or("");
-            let ok = !hd.is_empty()
-                && provider
+            if hd.is_empty() {
+                return Err(LoginError::NoCompanyAccount);
+            }
+            let ok = provider.allowed_domains.is_empty()
+                || provider
                     .allowed_domains
                     .iter()
                     .any(|d| d.eq_ignore_ascii_case(hd));
             if !ok {
                 return Err(LoginError::DomainNotAllowed);
             }
-            Ok(false)
+            let hd = hd.to_lowercase();
+            Ok((
+                false,
+                OrgKey {
+                    kind: "google_hd".into(),
+                    value: hd.clone(),
+                    name: hd,
+                },
+            ))
         }
         ProviderKind::Okta => {
             let g = groups(claims, &provider.groups_claim);
@@ -269,17 +330,54 @@ pub fn check_company(provider: &ProviderConfig, claims: &Value) -> Result<bool, 
                     "your Okta account is not in the group \"{required}\" that this server requires"
                 )));
             }
-            Ok(provider.admin_group.as_ref().is_some_and(|a| g.contains(a)))
+            let issuer = provider.issuer();
+            Ok((
+                provider.admin_group.as_ref().is_some_and(|a| g.contains(a)),
+                OrgKey {
+                    kind: "okta".into(),
+                    name: email_domain.unwrap_or_else(|| issuer.clone()),
+                    value: issuer,
+                },
+            ))
         }
         ProviderKind::Entra => {
             let tid = claims.get("tid").and_then(Value::as_str).unwrap_or("");
-            if Some(tid) != provider.tenant_id.as_deref() || tid.is_empty() {
+            let single = provider.tenant_id.as_deref().filter(|t| !t.is_empty());
+            if tid.is_empty() || single.is_some_and(|t| t != tid) {
                 return Err(LoginError::AccessDenied(
                     "your Microsoft account belongs to a different organization".into(),
                 ));
             }
             let g = groups(claims, &provider.groups_claim);
-            Ok(provider.admin_group.as_ref().is_some_and(|a| g.contains(a)))
+            Ok((
+                provider.admin_group.as_ref().is_some_and(|a| g.contains(a)),
+                OrgKey {
+                    kind: "entra_tid".into(),
+                    value: tid.to_string(),
+                    name: email_domain.unwrap_or_else(|| tid.to_string()),
+                },
+            ))
+        }
+        ProviderKind::Oidc => {
+            let claim = provider.org_claim.as_deref().unwrap_or("org_id");
+            let value = match claims.get(claim) {
+                Some(Value::String(s)) if !s.is_empty() => s.clone(),
+                Some(Value::Number(n)) => n.to_string(),
+                _ => {
+                    return Err(LoginError::AccessDenied(
+                        "your account does not say which organization it belongs to".into(),
+                    ));
+                }
+            };
+            let mapped = provider.org_map.get(&value).cloned().unwrap_or(value);
+            Ok((
+                false,
+                OrgKey {
+                    kind: "oidc".into(),
+                    value: format!("{}#{mapped}", provider.issuer()),
+                    name: mapped,
+                },
+            ))
         }
     }
 }

@@ -89,7 +89,10 @@ async fn s5d_ac_uc_agentslam_connect_cimd_login() {
         .set_claims(json!({"sub": "g-roman", "email": "roman@example.com", "hd": "example.com"}));
     let r = b.sign_in(&env, "google", Some(&req)).await;
     assert_eq!(r.status(), 303);
-    // No page asks for a name: sign-in continues straight to consent.
+    // First person of example.com: create the organization, then straight to
+    // consent (no page asks for a name).
+    assert!(location(&r).starts_with("/org/create?req="));
+    let r = b.complete_org_create(r).await;
     let consent = location(&r);
     assert!(consent.starts_with("/consent?req="), "{consent}");
     let page = b.get(&consent).await.text().await.expect("consent html");
@@ -249,19 +252,23 @@ async fn assert_no_codes(env: &Env) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn s5d_ac_uc_agentslam_connect_wrong_domain() {
-    let env = Env::start().await;
-    for claims in [
-        json!({"sub": "g-x", "email": "x@gmail.com"}),
-        json!({"sub": "g-y", "email": "y@other.com", "hd": "other.com"}),
+    // The instance accepts only example.com.
+    let env = Env::start_with(|c| c.allowed_domains = vec!["example.com".into()]).await;
+    for (claims, message) in [
+        (
+            json!({"sub": "g-x", "email": "x@gmail.com"}),
+            "A company account is needed",
+        ),
+        (
+            json!({"sub": "g-y", "email": "y@other.com", "hd": "other.com"}),
+            "Your organization can&#39;t use this server",
+        ),
     ] {
         let (b, req, cb) = oauth_sign_in(&env, "google", claims).await;
         assert_eq!(cb.status(), 403);
         assert!(cb.headers().get("location").is_none());
         let html = cb.text().await.expect("html");
-        assert!(
-            html.contains("This account isn&#39;t allowed here"),
-            "{html}"
-        );
+        assert!(html.contains(message), "{html}");
         // No session, so no consent page and no code.
         let consent = b.get(&format!("/consent?req={req}")).await;
         assert_eq!(consent.status(), 303);
@@ -280,6 +287,8 @@ async fn s5d_ac_uc_agentslam_connect_okta_login() {
     )
     .await;
     assert_eq!(cb.status(), 303);
+    // First person of this Okta org creates its organization, then consents.
+    let cb = b.complete_org_create(cb).await;
     let consent = location(&cb);
     assert!(consent.starts_with("/consent?req="), "{consent}");
     let page = b.get(&consent).await;
@@ -312,6 +321,7 @@ async fn s5d_ac_uc_agentslam_connect_entra_tenant() {
     )
     .await;
     assert_eq!(cb.status(), 303);
+    let cb = b.complete_org_create(cb).await;
     let page = b.get(&location(&cb)).await;
     assert_eq!(page.status(), 200, "tenant T reaches consent");
 
@@ -337,14 +347,36 @@ async fn s5d_ac_uc_agentslam_connect_no_email_merge() {
         .set_claims(json!({"sub": "entra-roman", "tid": "T", "email": "roman@example.com"}));
     let cb = b.sign_in(&env, "entra", None).await;
     assert_eq!(cb.status(), 303);
+    // A different identity key: its own organization (tenant T), its own person.
+    let cb = b.complete_org_create(cb).await;
     assert_eq!(location(&cb), "/", "no page asks for a name");
-    // A new person, not roman: the email only names it, with a suffix on collision.
     let me = b.get_json("/api/me").await;
-    assert_eq!(me["handle"], json!("roman-2"));
+    assert_eq!(me["handle"], json!("roman"), "names are per organization");
+    let orgs: i64 = env
+        .server
+        .state
+        .db
+        .call(|c| {
+            Ok(
+                c.query_row("SELECT COUNT(DISTINCT org_id) FROM persons", [], |r| {
+                    r.get(0)
+                })?,
+            )
+        })
+        .await
+        .expect("db");
+    assert_eq!(
+        orgs, 2,
+        "the Entra identity is a person of its own organization"
+    );
     assert_eq!(me["agents"], json!([]), "no access to roman's agents");
     let rooms = b.get_json("/api/rooms").await;
     assert_eq!(rooms["rooms"], json!([]), "no access to roman's rooms");
-    assert_eq!(b.get("/api/rooms/ios").await.status(), 403);
+    assert_eq!(
+        b.get("/api/rooms/ios").await.status(),
+        404,
+        "another organization's room does not exist for it"
+    );
 }
 
 /// Not an acceptance criterion (B1): the person's name is derived from the
@@ -364,6 +396,8 @@ async fn handle_is_derived_from_email_with_suffix_on_collision() {
             .set_claims(json!({"sub": sub, "email": email, "hd": "example.com"}));
         let cb = b.sign_in(&env, "google", None).await;
         assert_eq!(cb.status(), 303);
+        // The first one creates the example.com organization; the rest join it.
+        let cb = b.complete_org_create(cb).await;
         assert_eq!(location(&cb), "/");
         names.push(b.get_json("/api/me").await["handle"].clone());
         // Signing in again keeps the same name.

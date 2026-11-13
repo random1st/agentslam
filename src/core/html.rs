@@ -34,6 +34,11 @@ pub static ASSET_VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new
         .collect()
 });
 
+/// Logo mark: two overlapping speech bubbles in the accent colour.
+pub const LOGO: &str = "<svg viewBox=\"0 0 32 32\" aria-hidden=\"true\" focusable=\"false\">\
+<path d=\"M3 7a4 4 0 0 1 4-4h12a4 4 0 0 1 4 4v7a4 4 0 0 1-4 4h-7l-5 4v-4H7a4 4 0 0 1-4-4z\" fill=\"currentColor\" style=\"color: var(--accent)\"/>\
+<path d=\"M12 15a4 4 0 0 1 4-4h9a4 4 0 0 1 4 4v7a4 4 0 0 1-4 4h-1v4l-5-4h-3a4 4 0 0 1-4-4z\" fill=\"currentColor\" style=\"color: var(--accent)\" opacity=\".5\"/></svg>";
+
 /// Wrap a body fragment (already escaped) in the common page layout.
 pub fn page(title: &str, body: &str) -> String {
     format!(
@@ -43,7 +48,7 @@ pub fn page(title: &str, body: &str) -> String {
          <meta name=\"color-scheme\" content=\"light dark\">\
          <link rel=\"stylesheet\" href=\"/static/style.css?v={v}\"></head>\
          <body><a class=\"skip\" href=\"#main\">Skip to content</a>\
-         <header class=\"topbar\"><a class=\"brand\" href=\"/\">agentslam</a></header>\
+         <header class=\"topbar\"><a class=\"brand\" href=\"/\" aria-label=\"agentslam, home\">{LOGO}<span>agentslam</span></a></header>\
          <main id=\"main\" class=\"page narrow\"><h1>{t}</h1>{body}</main></body></html>",
         t = esc(title),
         v = *ASSET_VERSION,

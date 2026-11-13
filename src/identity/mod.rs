@@ -2,6 +2,7 @@ pub mod auth;
 pub mod cimd;
 pub mod oauth;
 pub mod oidc;
+pub mod orgs;
 pub mod people;
 pub mod session;
 pub mod tokens;
@@ -12,6 +13,8 @@ pub mod tokens;
 pub struct Caller {
     pub agent_id: i64,
     pub person_id: i64,
+    /// The caller's organization (B13): every room operation is scoped to it.
+    pub org_id: i64,
     pub handle: String,
     pub label: String,
     pub token_hash: String,

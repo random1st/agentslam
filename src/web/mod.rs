@@ -48,6 +48,14 @@ pub fn routes() -> Router<Shared> {
         .route("/api/agent-tokens", post(mint_token))
         .route("/api/credentials/{family}/revoke", post(revoke))
         .route("/api/admin/link", post(admin_link))
+        .route("/api/org", get(org_info))
+        .route("/api/org/admins", post(org_add_admin))
+        .route("/api/org/okta", post(org_add_okta))
+        .route("/api/operator/orgs", get(operator_orgs))
+        .route(
+            "/api/operator/orgs/{id}/disable",
+            post(operator_disable_org),
+        )
 }
 
 fn asset(content_type: &'static str, body: &'static str) -> Response {
@@ -75,6 +83,10 @@ async fn index(MaybeSession(sess): MaybeSession) -> Response {
                 ),
         )
             .into_response(),
+        // Signed in but the organization does not exist yet: offer to create it.
+        Some(s) if s.identity.org_key.is_some() && s.identity.person_id.is_none() => {
+            Redirect::to("/org/create").into_response()
+        }
         // Signed out, or a session from before names were derived: sign in.
         _ => Redirect::to("/login").into_response(),
     }
@@ -83,6 +95,7 @@ async fn index(MaybeSession(sess): MaybeSession) -> Response {
 pub fn person(user: &WebUser) -> Person {
     Person {
         person_id: user.person_id,
+        org_id: user.org_id,
         is_admin: user.session.is_admin,
     }
 }
@@ -97,6 +110,8 @@ async fn me(State(state): State<Shared>, user: WebUser) -> Result<Json<serde_jso
     Ok(Json(json!({
         "handle": user.handle,
         "is_admin": user.session.is_admin,
+        "is_operator": user.session.is_operator,
+        "org": {"name": user.org_name},
         "csrf": user.session.csrf,
         "identity": {"issuer": user.session.identity.issuer, "sub": user.session.identity.sub, "provider": user.session.identity.provider_id, "email": user.session.identity.email},
         "agents": agents,
@@ -256,12 +271,16 @@ async fn revoke(
     let now = state.clock.now();
     let pid = user.person_id;
     let admin = user.session.is_admin;
+    let org_id = user.org_id;
     let agent_id = state
         .db
         .call(move |c| {
+            // Scoped to the caller's organization: another org's credential is "not found".
             let owner: Option<i64> = rusqlite::OptionalExtension::optional(c.query_row(
-                "SELECT a.person_id FROM tokens t JOIN agents a ON a.id = t.agent_id WHERE t.family_id = ?1 LIMIT 1",
-                [&family],
+                "SELECT a.person_id FROM tokens t JOIN agents a ON a.id = t.agent_id
+                 JOIN persons p ON p.id = a.person_id
+                 WHERE t.family_id = ?1 AND p.org_id = ?2 LIMIT 1",
+                rusqlite::params![family, org_id],
                 |r| r.get(0),
             ))?;
             match owner {
@@ -298,9 +317,213 @@ async fn admin_link(
     if !user.session.is_admin {
         return Err(Error::Forbidden("admin only".into()));
     }
+    let org_id = user.org_id;
     state
         .db
-        .call(move |c| people::link_identity(c, &req.issuer, &req.sub, &req.handle))
+        .call(move |c| people::link_identity(c, org_id, &req.issuer, &req.sub, &req.handle))
         .await?;
+    Ok(ok())
+}
+
+// ---------------------------------------------------------------- organization (B13)
+
+/// The person's organization: name, admins, connected Okta (never its secret).
+async fn org_info(State(state): State<Shared>, user: WebUser) -> Result<Json<serde_json::Value>> {
+    let org_id = user.org_id;
+    let (admins, okta): (Vec<String>, Vec<serde_json::Value>) = state
+        .db
+        .call(move |c| {
+            let admins = {
+                let mut s = c.prepare(
+                    "SELECT p.handle FROM org_admins a JOIN persons p ON p.id = a.person_id
+                     WHERE a.org_id = ?1 ORDER BY p.handle",
+                )?;
+                s.query_map([org_id], |r| r.get(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()?
+            };
+            let okta = {
+                let mut s = c.prepare(
+                    "SELECT id, issuer, client_id, created_at FROM okta_connections WHERE org_id = ?1 ORDER BY id",
+                )?;
+                s.query_map([org_id], |r| {
+                    let id: i64 = r.get(0)?;
+                    Ok(json!({
+                        "id": id,
+                        "issuer": r.get::<_, String>(1)?,
+                        "client_id": r.get::<_, String>(2)?,
+                        "created_at": r.get::<_, i64>(3)?,
+                        "sign_in_path": format!("/login/okta/{id}"),
+                    }))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            Ok((admins, okta))
+        })
+        .await?;
+    Ok(Json(json!({
+        "name": user.org_name,
+        "is_admin": user.session.is_admin,
+        "admins": admins,
+        "okta_connections": okta,
+        "can_store_secrets": state.config.secret_key.is_some(),
+    })))
+}
+
+fn require_org_admin(user: &WebUser) -> Result<()> {
+    if user.session.is_admin {
+        Ok(())
+    } else {
+        Err(Error::Forbidden(
+            "only an admin of your organization can do this".into(),
+        ))
+    }
+}
+
+#[derive(Deserialize)]
+struct AdminRequest {
+    handle: String,
+}
+
+/// An org admin names another person of the same organization as admin.
+async fn org_add_admin(
+    State(state): State<Shared>,
+    user: WebUser,
+    headers: HeaderMap,
+    Json(req): Json<AdminRequest>,
+) -> Result<Json<serde_json::Value>> {
+    check_csrf(&user.session, &headers, None)?;
+    require_org_admin(&user)?;
+    let org_id = user.org_id;
+    let now = state.clock.now();
+    state
+        .db
+        .call(move |c| {
+            let pid: i64 = rusqlite::OptionalExtension::optional(c.query_row(
+                "SELECT id FROM persons WHERE handle = ?1 AND org_id = ?2",
+                rusqlite::params![req.handle, org_id],
+                |r| r.get(0),
+            ))?
+            .ok_or(Error::NotFound)?;
+            crate::identity::orgs::add_admin(c, org_id, pid, now)
+        })
+        .await?;
+    Ok(ok())
+}
+
+#[derive(Deserialize)]
+struct OktaRequest {
+    issuer: String,
+    client_id: String,
+    client_secret: String,
+}
+
+/// An org admin connects the organization's Okta. The secret is stored
+/// AES-GCM encrypted and no API returns it.
+async fn org_add_okta(
+    State(state): State<Shared>,
+    user: WebUser,
+    headers: HeaderMap,
+    Json(req): Json<OktaRequest>,
+) -> Result<Response> {
+    check_csrf(&user.session, &headers, None)?;
+    require_org_admin(&user)?;
+    let Some(key) = state.config.secret_key else {
+        return Err(Error::BadRequest(
+            "this server cannot store secrets: AGENTSLAM_SECRET_KEY is not set".into(),
+        ));
+    };
+    let issuer = req.issuer.trim().trim_end_matches('/').to_string();
+    let parsed = url::Url::parse(&issuer)
+        .map_err(|_| Error::BadRequest("the Okta address must be a URL".into()))?;
+    if parsed.scheme() != "https" && !state.config.allow_insecure_http_for_tests {
+        return Err(Error::BadRequest(
+            "the Okta address must start with https://".into(),
+        ));
+    }
+    if req.client_id.trim().is_empty() || req.client_secret.is_empty() {
+        return Err(Error::BadRequest(
+            "client ID and client secret are required".into(),
+        ));
+    }
+    let enc = crate::identity::orgs::encrypt_secret(&key, &req.client_secret)?;
+    let org_id = user.org_id;
+    let now = state.clock.now();
+    let client_id = req.client_id.trim().to_string();
+    let id: i64 = state
+        .db
+        .call(move |c| {
+            c.execute(
+                "INSERT INTO okta_connections (org_id, issuer, client_id, secret_enc, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![org_id, issuer, client_id, enc, now],
+            )?;
+            Ok(c.last_insert_rowid())
+        })
+        .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({"id": id, "sign_in_path": format!("/login/okta/{id}")})),
+    )
+        .into_response())
+}
+
+/// Instance operators (config `admins`) list and disable organizations.
+async fn operator_orgs(
+    State(state): State<Shared>,
+    user: WebUser,
+) -> Result<Json<serde_json::Value>> {
+    if !user.session.is_operator {
+        return Err(Error::Forbidden("instance operators only".into()));
+    }
+    let orgs: Vec<serde_json::Value> = state
+        .db
+        .call(|c| {
+            let mut s = c.prepare(
+                "SELECT id, name, key_kind, disabled_at IS NOT NULL FROM organizations ORDER BY name",
+            )?;
+            Ok(s.query_map([], |r| {
+                Ok(json!({"id": r.get::<_, i64>(0)?, "name": r.get::<_, String>(1)?,
+                          "kind": r.get::<_, String>(2)?, "disabled": r.get::<_, bool>(3)?}))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await?;
+    Ok(Json(json!({"organizations": orgs})))
+}
+
+async fn operator_disable_org(
+    State(state): State<Shared>,
+    user: WebUser,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>> {
+    check_csrf(&user.session, &headers, None)?;
+    if !user.session.is_operator {
+        return Err(Error::Forbidden("instance operators only".into()));
+    }
+    let now = state.clock.now();
+    let agents: Vec<i64> = state
+        .db
+        .call(move |c| {
+            let n = c.execute(
+                "UPDATE organizations SET disabled_at = ?2 WHERE id = ?1 AND disabled_at IS NULL",
+                rusqlite::params![id, now],
+            )?;
+            if n == 0 {
+                return Err(Error::NotFound);
+            }
+            let mut s = c.prepare(
+                "SELECT a.id FROM agents a JOIN persons p ON p.id = a.person_id WHERE p.org_id = ?1",
+            )?;
+            Ok(s.query_map([id], |r| r.get(0))?
+                .collect::<rusqlite::Result<Vec<i64>>>()?)
+        })
+        .await?;
+    // Open waits of that organization's agents re-check and end (tokens no longer resolve).
+    for agent_id in agents {
+        state.hub.publish(Event::AccessChanged {
+            agent_id,
+            room_id: None,
+        });
+    }
     Ok(ok())
 }

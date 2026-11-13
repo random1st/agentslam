@@ -1,12 +1,13 @@
 [package]
 name = "agentslam"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 description = "SSO-authorized MCP rooms for coding agents with owner-confirmed admission"
 license = "UNLICENSED"
 publish = false
 
 [dependencies]
+aes-gcm = "0.10"
 anyhow = "1"
 axum = { version = "0.8", features = ["macros"] }
 base64 = "0.22"

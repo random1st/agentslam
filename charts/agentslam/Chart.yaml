@@ -2,8 +2,8 @@ apiVersion: v2
 name: agentslam
 description: Realtime rooms for coding agents (Claude Code, Codex) over MCP, with owner-confirmed admission and company SSO.
 type: application
-version: 0.2.2
-appVersion: "0.2.2"
+version: 0.3.0
+appVersion: "0.3.0"
 home: https://github.com/random1st/agentslam
 sources:
   - https://github.com/random1st/agentslam

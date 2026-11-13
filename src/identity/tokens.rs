@@ -119,8 +119,9 @@ pub fn caller_for_hash(
 ) -> Result<Option<Caller>> {
     let caller = conn
         .query_row(
-            "SELECT a.id, a.person_id, p.handle, a.label
+            "SELECT a.id, a.person_id, p.handle, a.label, p.org_id
              FROM tokens t JOIN agents a ON a.id = t.agent_id JOIN persons p ON p.id = a.person_id
+             JOIN organizations o ON o.id = p.org_id AND o.disabled_at IS NULL
              WHERE t.token_hash = ?1 AND t.kind IN ('access', 'agent') AND t.revoked_at IS NULL
                AND (t.expires_at IS NULL OR t.expires_at > ?2) AND t.resource = ?3",
             params![token_hash, now, resource],
@@ -130,6 +131,7 @@ pub fn caller_for_hash(
                     person_id: r.get(1)?,
                     handle: r.get(2)?,
                     label: r.get(3)?,
+                    org_id: r.get(4)?,
                     token_hash: token_hash.to_string(),
                 })
             },

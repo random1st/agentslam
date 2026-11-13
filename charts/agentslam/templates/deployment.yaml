@@ -57,6 +57,13 @@ spec:
                   key: {{ .key }}
             {{- end }}
             {{- end }}
+            {{- if .Values.secretKeyKey }}
+            - name: AGENTSLAM_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "existingSecret is required when secretKeyKey is set" .Values.existingSecret }}
+                  key: {{ .Values.secretKeyKey }}
+            {{- end }}
           volumeMounts:
             - name: config
               mountPath: /etc/agentslam

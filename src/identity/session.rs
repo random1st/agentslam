@@ -42,7 +42,12 @@ pub struct WebSession {
     pub person_id: Option<i64>,
     pub handle: Option<String>,
     pub csrf: String,
+    /// Admin of the person's own organization (org admin, IdP admin group or operator).
     pub is_admin: bool,
+    /// Instance operator (config `admins`): may disable organizations.
+    pub is_operator: bool,
+    /// The person's organization; None until the person exists.
+    pub org: Option<crate::identity::orgs::Org>,
 }
 
 /// Create a session for an identity; returns the Set-Cookie header value.
@@ -93,18 +98,29 @@ pub async fn load_session(state: &Shared, headers: &HeaderMap) -> Result<Option<
             let Some(identity) = people::identity_by_id(c, identity_id)? else {
                 return Ok(None);
             };
-            let handle = match identity.person_id {
-                Some(pid) => people::person_handle(c, pid)?,
-                None => None,
+            let is_operator = people::is_operator(&cfg, &identity);
+            let (person_id, handle, org) = match identity.person_id {
+                Some(pid) => match crate::identity::orgs::org_of_person(c, pid)? {
+                    // A disabled organization signs everyone out (B13).
+                    Some(org) if org.disabled => return Ok(None),
+                    Some(org) => (Some(pid), people::person_handle(c, pid)?, Some(org)),
+                    None => (None, None, None),
+                },
+                None => (None, None, None),
             };
-            let is_admin = people::is_admin(&cfg, &identity);
+            let is_admin = match &org {
+                Some(o) => people::is_admin(c, &cfg, &identity, o.id)?,
+                None => false,
+            };
             Ok(Some(WebSession {
                 token_hash,
-                person_id: identity.person_id,
+                person_id,
                 identity,
                 handle,
                 csrf,
                 is_admin,
+                is_operator,
+                org,
             }))
         })
         .await
@@ -156,6 +172,9 @@ pub struct WebUser {
     pub session: WebSession,
     pub person_id: i64,
     pub handle: String,
+    /// The person's organization (B13): every web query is scoped to it.
+    pub org_id: i64,
+    pub org_name: String,
 }
 
 impl FromRequestParts<Shared> for WebUser {
@@ -164,13 +183,19 @@ impl FromRequestParts<Shared> for WebUser {
         let session = load_session(state, &parts.headers)
             .await?
             .ok_or(Error::Unauthorized)?;
-        match (session.person_id, session.handle.clone()) {
-            (Some(person_id), Some(handle)) => Ok(WebUser {
+        match (
+            session.person_id,
+            session.handle.clone(),
+            session.org.clone(),
+        ) {
+            (Some(person_id), Some(handle), Some(org)) => Ok(WebUser {
                 session,
                 person_id,
                 handle,
+                org_id: org.id,
+                org_name: org.name,
             }),
-            // Sessions created before names were derived (B1): signing in again creates the person.
+            // No person yet (organization not created) or a pre-name session: sign in again.
             _ => Err(Error::Unauthorized),
         }
     }

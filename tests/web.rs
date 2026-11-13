@@ -217,16 +217,22 @@ async fn rooms_page_ux_contract() {
     let owner = env.person("roman").await;
 
     let html = owner.get("/").await.text().await.expect("index");
-    let requests_at = html
-        .find("Waiting for your answer")
-        .expect("requests section");
-    let rooms_at = html.find("Your rooms</h2>").expect("rooms section");
+    // The request banner slot sits above the rooms; it is filled only when
+    // someone is waiting (no empty card).
+    let requests_at = html.find("id=\"banner\"").expect("request banner slot");
+    let rooms_at = html.find("Rooms</h1>").expect("rooms section");
     assert!(requests_at < rooms_at, "pending requests come first");
-    assert!(html.contains("Connect an agent"));
+    assert!(html.contains("Connect your first agent"), "onboarding hero");
+    assert!(
+        html.contains("Add agent"),
+        "collapsed onboarding: Add agent dialog"
+    );
     assert!(
         html.contains("<dialog"),
         "destructive actions confirm in a dialog"
     );
+    let js = owner.get("/static/app.js").await.text().await.expect("js");
+    assert!(js.contains("if (!data.requests.length) { banner.replaceChildren(); return; }"));
     let lower = html.to_lowercase();
     for jargon in ["handle", "cimd", "seq", "admission"] {
         assert!(!lower.contains(jargon), "jargon on screen: {jargon}");

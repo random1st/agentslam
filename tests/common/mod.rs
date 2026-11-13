@@ -272,10 +272,18 @@ pub struct Env {
     pub base: String,
     pub google: FakeIdp,
     pub okta: FakeIdp,
+    /// Single-tenant Entra provider (tenant T).
     pub entra: FakeIdp,
+    /// Multi-tenant Entra provider (any tid; the organization is the tid).
+    pub entra_multi: FakeIdp,
+    /// Generic OIDC provider with org_claim = org_id.
+    pub oidc: FakeIdp,
     pub cimd: CimdServer,
     people: tokio::sync::Mutex<HashMap<String, Arc<Browser>>>,
 }
+
+/// Fixed test key for stored Okta secrets (not a real secret).
+pub const TEST_SECRET_KEY: [u8; 32] = [42u8; 32];
 
 fn provider(id: &str, kind: ProviderKind, issuer: &str) -> ProviderConfig {
     ProviderConfig {
@@ -291,38 +299,54 @@ fn provider(id: &str, kind: ProviderKind, issuer: &str) -> ProviderConfig {
         tenant_id: None,
         groups_claim: "groups".to_string(),
         admin_group: None,
+        org_claim: None,
+        org_map: Default::default(),
     }
 }
 
 impl Env {
     pub async fn start() -> Env {
+        Env::start_with(|_| {}).await
+    }
+
+    /// Start with a config tweak (instance restrictions, operators, ...).
+    pub async fn start_with(customize: impl FnOnce(&mut Config)) -> Env {
         let google = FakeIdp::start("agentslam-google").await;
         let okta = FakeIdp::start("agentslam-okta").await;
         let entra = FakeIdp::start("agentslam-entra").await;
+        let entra_multi = FakeIdp::start("agentslam-entra-multi").await;
+        let oidc = FakeIdp::start("agentslam-oidc").await;
         let cimd = CimdServer::start().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
         let base = format!("http://{}", listener.local_addr().expect("addr"));
-        let mut g = provider("google", ProviderKind::Google, &google.url);
-        g.allowed_domains = vec!["example.com".into()];
+        let g = provider("google", ProviderKind::Google, &google.url);
         let mut o = provider("okta", ProviderKind::Okta, &okta.url);
         o.required_group = Some("agents".into());
         let mut e = provider("entra", ProviderKind::Entra, &entra.url);
         e.tenant_id = Some("T".into());
-        let config = Config {
+        let em = provider("entra-multi", ProviderKind::Entra, &entra_multi.url);
+        let mut oi = provider("oidc", ProviderKind::Oidc, &oidc.url);
+        oi.org_claim = Some("org_id".into());
+        let mut config = Config {
             bind: "127.0.0.1:0".parse().expect("addr"),
             public_url: base.clone(),
             database: ":memory:".into(),
             secure_cookies: false,
             allow_insecure_http_for_tests: true,
-            providers: vec![g, o, e],
+            providers: vec![g, o, e, em, oi],
             oauth: OAuthConfig {
                 allowed_clients: vec![cimd.client("claude.json"), cimd.client("codex.json")],
                 ..OAuthConfig::default()
             },
             admins: vec![],
+            summary: Default::default(),
+            allowed_domains: vec![],
+            allowed_tenants: vec![],
+            secret_key: Some(TEST_SECRET_KEY),
         };
+        customize(&mut config);
         config.validate().expect("test config valid");
         let server = agentslam::core::app::serve(config, Some(listener))
             .await
@@ -333,6 +357,8 @@ impl Env {
             google,
             okta,
             entra,
+            entra_multi,
+            oidc,
             cimd,
             people: Default::default(),
         }
@@ -342,6 +368,8 @@ impl Env {
         match provider {
             "google" => &self.google,
             "okta" => &self.okta,
+            "entra-multi" => &self.entra_multi,
+            "oidc" => &self.oidc,
             _ => &self.entra,
         }
     }
@@ -352,31 +380,35 @@ impl Env {
 
     /// Signed-in person (Google, hd example.com, sub = g-<handle>, email <handle>@example.com).
     /// The name is derived from the email at first sign-in, so it equals `handle`.
+    /// The first person of example.com creates its organization (and is its admin).
     pub async fn person(&self, handle: &str) -> Arc<Browser> {
+        self.person_in(handle, "example.com").await
+    }
+
+    /// Signed-in person of the Workspace domain `domain` (one organization per domain).
+    pub async fn person_in(&self, handle: &str, domain: &str) -> Arc<Browser> {
+        let key = format!("{handle}@{domain}");
         let mut people = self.people.lock().await;
-        if let Some(b) = people.get(handle) {
+        if let Some(b) = people.get(&key) {
             return b.clone();
         }
         let b = self.browser();
-        self.google.set_claims(json!({"sub": format!("g-{handle}"), "email": format!("{handle}@example.com"), "hd": "example.com"}));
+        self.google.set_claims(json!({"sub": format!("g-{handle}-{domain}"), "email": format!("{handle}@{domain}"), "hd": domain}));
         let resp = b.sign_in(self, "google", None).await;
+        let resp = b.complete_org_create(resp).await;
         assert_eq!(resp.status(), 303, "sign-in redirect");
-        assert_eq!(
-            location(&resp),
-            "/",
-            "first sign-in goes straight to the rooms page"
-        );
+        assert_eq!(location(&resp), "/", "sign-in ends on the rooms page");
         let me = b.get_json("/api/me").await;
         assert_eq!(me["handle"], json!(handle), "name derived from the email");
         let b = Arc::new(b);
-        people.insert(handle.to_string(), b.clone());
+        people.insert(key, b.clone());
         b
     }
 
     /// Fresh web session for an existing person (e.g. after the clock moved past session expiry).
     pub async fn relogin(&self, handle: &str) -> Browser {
         let b = self.browser();
-        self.google.set_claims(json!({"sub": format!("g-{handle}"), "email": format!("{handle}@example.com"), "hd": "example.com"}));
+        self.google.set_claims(json!({"sub": format!("g-{handle}-example.com"), "email": format!("{handle}@example.com"), "hd": "example.com"}));
         let resp = b.sign_in(self, "google", None).await;
         assert_eq!(resp.status(), 303);
         assert_eq!(location(&resp), "/", "existing person signs straight in");
@@ -385,7 +417,11 @@ impl Env {
 
     /// `<handle>/<label>` agent with a headless token minted in the web UI.
     pub async fn agent(&self, handle: &str, label: &str) -> Mcp {
-        let b = self.person(handle).await;
+        self.agent_in(handle, label, "example.com").await
+    }
+
+    pub async fn agent_in(&self, handle: &str, label: &str, domain: &str) -> Mcp {
+        let b = self.person_in(handle, domain).await;
         let token = b.mint(label).await.0;
         Mcp::new(&self.base, &token)
     }
@@ -605,6 +641,28 @@ impl Browser {
         let r = self.get(&location(&r)).await;
         assert_eq!(r.status(), 303, "IdP redirects back");
         self.get(&location(&r)).await
+    }
+
+    /// Current value of a cookie this browser holds (for headless screenshots).
+    pub fn cookie_value(&self, name: &str) -> Option<String> {
+        self.cookies.lock().expect("lock").get(name).cloned()
+    }
+
+    /// If sign-in led to "Create the organization for …", confirm it and
+    /// return the resulting redirect; otherwise return `resp` unchanged.
+    pub async fn complete_org_create(&self, resp: reqwest::Response) -> reqwest::Response {
+        let loc = location(&resp);
+        if resp.status() != 303 || !loc.starts_with("/org/create") {
+            return resp;
+        }
+        let page = self.get(&loc).await;
+        assert_eq!(page.status(), 200, "org create page");
+        let html = page.text().await.expect("html");
+        assert!(html.contains("Create the organization for"), "{html}");
+        let csrf = extract_input(&html, "csrf").expect("csrf");
+        let req = extract_input(&html, "req").unwrap_or_default();
+        self.post_form("/org/create", &[("csrf", &csrf), ("req", &req)])
+            .await
     }
 
     /// Mint a headless agent token; returns (token, family_id).

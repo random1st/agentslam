@@ -44,6 +44,12 @@ app.kubernetes.io/instance: {{ .Release.Name }}
     "access_token_ttl_s" (int .Values.oauth.accessTokenTtlS)
     "refresh_token_ttl_s" (int .Values.oauth.refreshTokenTtlS)
     "code_ttl_s" (int .Values.oauth.codeTtlS))
+  "summary" (dict
+    "interval_s" (int .Values.summary.intervalS)
+    "min_messages" (int .Values.summary.minMessages)
+    "request_ttl_s" (int .Values.summary.requestTtlS))
+  "allowed_domains" (.Values.allowedDomains | default list)
+  "allowed_tenants" (.Values.allowedTenants | default list)
   "admins" .Values.admins -}}
 {{- toToml $cfg -}}
 {{- end -}}

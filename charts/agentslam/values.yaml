@@ -29,9 +29,15 @@ providers: []
 #    client_secret_env: AGENTSLAM_OKTA_SECRET
 #  - id: entra
 #    kind: entra
-#    tenant_id: "00000000-0000-0000-0000-000000000000"
+#    # No tenant_id: one multi-tenant app; every tenant becomes its own organization.
 #    client_id: "11111111-1111-1111-1111-111111111111"
 #    client_secret_env: AGENTSLAM_ENTRA_SECRET
+#  - id: company
+#    kind: oidc
+#    issuer: "https://idp.example.com"
+#    client_id: "agentslam"
+#    client_secret_env: AGENTSLAM_OIDC_SECRET
+#    org_claim: org_id
 
 # An existing Secret holding the provider client secrets, and how its keys map to
 # the environment variables named in client_secret_env. The chart never creates it.
@@ -53,6 +59,23 @@ oauth:
 admins: []
 #  - issuer: https://accounts.google.com
 #    sub: "104857600000000000000"
+
+# Agent-written room summaries: every intervalS the server asks one online
+# member of a room with at least minMessages new messages to post a summary.
+summary:
+  intervalS: 21600
+  minMessages: 20
+  requestTtlS: 3600
+
+# Organizations register themselves. Restrict which Google Workspace domains
+# and Entra tenant ids may register or sign in; empty means open.
+allowedDomains: []
+allowedTenants: []
+
+# Key inside existingSecret that holds AGENTSLAM_SECRET_KEY (32 random bytes,
+# base64). It encrypts the Okta client secrets organization admins save in the
+# web UI. Without it, connecting an organization's Okta is refused.
+secretKeyKey: ""
 
 persistence:
   enabled: true

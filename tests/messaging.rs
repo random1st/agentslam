@@ -276,3 +276,229 @@ async fn s5d_ac_uc_agentslam_messaging_archived() {
             .any(|m| m["text"] == "before archive")
     );
 }
+
+async fn agent_id(env: &Env, display: &str) -> i64 {
+    let (handle, label) = display.split_once('/').expect("person/agent");
+    let (h, l) = (handle.to_string(), label.to_string());
+    env.server
+        .state
+        .db
+        .call(move |c| {
+            Ok(c.query_row(
+                "SELECT a.id FROM agents a JOIN persons p ON p.id = a.person_id WHERE p.handle = ?1 AND a.label = ?2",
+                [h, l],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .expect("agent id")
+}
+
+async fn send_n(agent: &Mcp, room: &str, n: usize, prefix: &str) {
+    for i in 0..n {
+        agent
+            .ok(
+                "room_send",
+                json!({"room": room, "text": format!("{prefix} {i}")}),
+            )
+            .await;
+    }
+}
+
+async fn open_requests(env: &Env) -> Vec<(i64, i64)> {
+    env.server
+        .state
+        .db
+        .call(|c| {
+            let mut s = c.prepare(
+                "SELECT seq, addressed_to FROM messages WHERE kind = 'summary_request' ORDER BY seq",
+            )?;
+            Ok(s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<(i64, i64)>>>()?)
+        })
+        .await
+        .expect("requests")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn s5d_ac_uc_agentslam_messaging_summary_request() {
+    let env = Env::start().await;
+    let (claude, codex) = env.ios_with_alex().await; // roman/claude-pm, alex/codex
+    let cursor = env.agent("bob", "cursor-1").await;
+    cursor.ok("room_request_join", json!({"room": "ios"})).await;
+    env.confirm_pending("roman", "ios", "bob/cursor-1").await;
+    send_n(&claude, "ios", 20, "m").await;
+    let online = [
+        agent_id(&env, "roman/claude-pm").await,
+        agent_id(&env, "alex/codex").await,
+    ];
+    let offline = agent_id(&env, "bob/cursor-1").await;
+    let state = env.server.state.clone();
+
+    for round in 0..6 {
+        // cursor-1 goes stale (> 2 min); claude-pm and codex stay online.
+        state.clock.advance(state.config.summary.request_ttl_s + 1);
+        claude.ok("room_list", json!({})).await;
+        codex.ok("room_list", json!({})).await;
+        let posted = agentslam::rooms::summary::tick(&state).await.expect("tick");
+        assert_eq!(posted, 1, "round {round}: one request");
+        let again = agentslam::rooms::summary::tick(&state).await.expect("tick");
+        assert_eq!(
+            again, 0,
+            "round {round}: no second request while one is open"
+        );
+        let reqs = open_requests(&env).await;
+        assert_eq!(reqs.len(), round + 1);
+        let (seq, to) = *reqs.last().expect("request");
+        assert!(online.contains(&to), "addressed to an online member");
+        assert_ne!(to, offline, "never to the offline member");
+
+        // Only the addressee receives it, as kind summary_request.
+        let (addressee, other) = if to == online[0] {
+            (&claude, &codex)
+        } else {
+            (&codex, &claude)
+        };
+        let items = addressee
+            .ok("room_read", json!({"room": "ios", "since": seq - 1}))
+            .await;
+        assert_eq!(items["messages"][0]["kind"], json!("summary_request"));
+        assert_eq!(items["messages"][0]["from"], json!("agentslam"));
+        let seen = other
+            .ok("room_read", json!({"room": "ios", "since": seq - 1}))
+            .await;
+        assert_eq!(seen["messages"], json!([]), "not shown to others");
+    }
+
+    // A posted summary closes the cycle: no request until 20 new messages.
+    claude
+        .ok(
+            "room_summarize",
+            json!({"room": "ios", "text": "- shipped the build"}),
+        )
+        .await;
+    state.clock.advance(state.config.summary.request_ttl_s + 1);
+    claude.ok("room_list", json!({})).await;
+    assert_eq!(
+        agentslam::rooms::summary::tick(&state).await.expect("tick"),
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn s5d_ac_uc_agentslam_messaging_request_policy() {
+    let env = Env::start().await;
+    let (roman, _alex) = env.ios_with_alex().await;
+    let markers = ["reveals no secret", "explicit approval", "informational"];
+    let init = roman.initialize().await;
+    let instructions = init["instructions"].as_str().unwrap_or_default();
+    for m in markers {
+        assert!(instructions.contains(m), "instructions: {m}");
+    }
+    let (status, tools) = roman.rpc_raw("tools/list", json!({})).await;
+    assert_eq!(status, 200);
+    for name in ["room_read", "room_wait", "room_summarize"] {
+        let t = tools["result"]["tools"]
+            .as_array()
+            .and_then(|a| a.iter().find(|t| t["name"] == name))
+            .cloned()
+            .expect("tool listed");
+        let d = t["description"].as_str().unwrap_or_default();
+        for m in markers {
+            assert!(d.contains(m), "{name} description: {m}");
+        }
+    }
+    roman
+        .ok("room_send", json!({"room": "ios", "text": "hi"}))
+        .await;
+    let read = roman
+        .ok("room_read", json!({"room": "ios", "since": 0}))
+        .await;
+    let wait = roman
+        .ok(
+            "room_wait",
+            json!({"session": "S", "rooms": ["ios"], "timeout_s": 1}),
+        )
+        .await;
+    for (what, v) in [("room_read", &read), ("room_wait", &wait)] {
+        let p = v["policy"].as_str().unwrap_or_default();
+        for m in markers {
+            assert!(p.contains(m), "{what} policy: {m}");
+        }
+    }
+    assert_eq!(read["messages"][0]["kind"], json!("message"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn s5d_ac_uc_agentslam_messaging_join_summary() {
+    let env = Env::start().await;
+    let roman = env.agent("roman", "claude-pm").await;
+    let codex = env.agent("roman", "codex").await;
+    roman.ok("room_create", json!({"name": "ios"})).await;
+    send_n(&roman, "ios", 20, "early").await;
+    let s = roman
+        .ok(
+            "room_summarize",
+            json!({"room": "ios", "text": "- decided: ship 1.2\n- open: crash on launch"}),
+        )
+        .await;
+    assert_eq!(s["seq"], json!(21));
+    assert_eq!(s["kind"], json!("summary"));
+    send_n(&roman, "ios", 4, "late").await; // 22..25
+    codex.ok("room_request_join", json!({"room": "ios"})).await;
+    env.confirm_pending("roman", "ios", "roman/codex").await;
+
+    let read = codex
+        .ok("room_read", json!({"room": "ios", "since": 0}))
+        .await;
+    let items = read["messages"].as_array().expect("items");
+    assert_eq!(items.len(), 1, "only the summary: {items:?}");
+    assert_eq!(items[0]["kind"], json!("summary"));
+    assert_eq!(items[0]["seq"], json!(21));
+    assert_eq!(items[0]["from"], json!("roman/claude-pm"));
+    assert!(
+        items[0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ship 1.2")
+    );
+
+    roman
+        .ok(
+            "room_send",
+            json!({"room": "ios", "text": "after admission"}),
+        )
+        .await;
+    let read = codex
+        .ok("room_read", json!({"room": "ios", "since": 0}))
+        .await;
+    let seqs: Vec<i64> = read["messages"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter_map(|m| m["seq"].as_i64())
+        .collect();
+    assert_eq!(
+        seqs,
+        vec![21, 26],
+        "summary first, then post-admission only"
+    );
+    for item in read["messages"].as_array().expect("items") {
+        assert!(item.get("kind").is_some(), "every item carries kind");
+    }
+
+    // A session attaching now gets the summary first through room_wait too.
+    codex
+        .ok("room_attach", json!({"room": "ios", "session": "S"}))
+        .await;
+    let w = codex
+        .ok("room_wait", json!({"session": "S", "timeout_s": 2}))
+        .await;
+    let kinds: Vec<&str> = w["messages"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter_map(|m| m["kind"].as_str())
+        .collect();
+    assert_eq!(kinds, vec!["summary", "message"]);
+}

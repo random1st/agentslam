@@ -17,13 +17,24 @@ database = "agentslam.db"
 # Keep true in production. false only for http://localhost development.
 secure_cookies = false
 
+# Organizations register themselves (one per Workspace domain, Entra tenant
+# or OIDC org claim) and never see each other. Restrict who may register or
+# sign in; empty lists mean open.
+allowed_domains = []   # e.g. ["example.org"]  (Google Workspace hd)
+allowed_tenants = []   # e.g. ["00000000-0000-0000-0000-000000000000"]  (Entra tid)
+#
+# Okta: an organization admin connects their Okta in the web UI. Its client
+# secret is encrypted with AGENTSLAM_SECRET_KEY (env only: 32 random bytes,
+# base64, e.g. `openssl rand -base64 32`). Without it, connecting Okta is refused.
+
 [[providers]]
 id = "google"
 kind = "google"
 client_id = "1234567890-example.apps.googleusercontent.com"
 client_secret_env = "AGENTSLAM_GOOGLE_SECRET"
-# Accepted only when the ID token `hd` claim is one of these.
-allowed_domains = ["example.com"]
+# Optional: accept only these `hd` values for this provider. Accounts without
+# `hd` (personal Gmail) are always refused.
+# allowed_domains = ["example.com"]
 
 # [[providers]]
 # id = "okta"
@@ -37,10 +48,31 @@ allowed_domains = ["example.com"]
 # [[providers]]
 # id = "entra"
 # kind = "entra"
-# tenant_id = "00000000-0000-0000-0000-000000000000"
+# # Leave tenant_id out for one multi-tenant app: every tenant becomes its own
+# # organization (issuer checked per tid). Set it to accept a single tenant.
+# # tenant_id = "00000000-0000-0000-0000-000000000000"
 # client_id = "11111111-1111-1111-1111-111111111111"
 # client_secret_env = "AGENTSLAM_ENTRA_SECRET"
 # admin_group = "<group object id>"  # optional
+
+# [[providers]]
+# id = "company"
+# kind = "oidc"                      # any OpenID Connect provider
+# issuer = "https://idp.example.com"
+# client_id = "agentslam"
+# client_secret_env = "AGENTSLAM_OIDC_SECRET"
+# org_claim = "org_id"               # ID token claim naming the organization (required)
+# [providers.org_map]                # optional: claim value -> organization
+# "1234" = "acme"
+
+# Agent-written room summaries (no model runs on the server): every interval_s
+# the server asks one online member of each room with at least min_messages new
+# messages to post a summary with room_summarize. A request lapses after
+# request_ttl_s. All optional; these are the defaults.
+[summary]
+interval_s = 21600
+min_messages = 20
+request_ttl_s = 3600
 
 [oauth]
 # CIMD client metadata URLs allowed to obtain codes (Claude Code, Codex).

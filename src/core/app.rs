@@ -37,6 +37,15 @@ pub type Shared = Arc<AppState>;
 impl AppState {
     pub fn new(config: Config) -> anyhow::Result<Shared> {
         let db = Db::open(&config.database)?;
+        let clock = Arc::new(Clock::default());
+        // B13: people and rooms from before organizations join one (nothing is lost).
+        let now = clock.now();
+        let moved = db
+            .blocking(|c| crate::identity::orgs::backfill(c, &config, now))
+            .map_err(|e| anyhow::anyhow!("organization backfill: {e}"))?;
+        if moved > 0 {
+            tracing::info!(people = moved, "assigned existing people to organizations");
+        }
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .connect_timeout(Duration::from_secs(5))
@@ -47,7 +56,7 @@ impl AppState {
         Ok(Arc::new(AppState {
             config: Arc::new(config),
             db,
-            clock: Arc::new(Clock::default()),
+            clock,
             hub: Hub::default(),
             oidc: Oidc::default(),
             cimd: CimdCache::default(),
@@ -134,6 +143,7 @@ pub async fn serve(config: Config, listener: Option<TcpListener>) -> anyhow::Res
     let addr = listener.local_addr()?;
     let state = AppState::new(config)?;
     let app = router(state.clone());
+    crate::rooms::summary::spawn_timer(state.clone());
     let (tx, rx) = oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
         let result = axum::serve(listener, app)

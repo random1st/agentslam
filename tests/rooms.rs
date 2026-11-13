@@ -174,6 +174,7 @@ async fn s5d_ac_uc_agentslam_rooms_no_agent_admission() {
         "room_read",
         "room_request_join",
         "room_send",
+        "room_summarize",
         "room_wait",
     ];
     expected.sort();

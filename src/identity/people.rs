@@ -20,6 +20,9 @@ pub struct Identity {
     pub email: Option<String>,
     pub name: Option<String>,
     pub group_admin: bool,
+    /// Organization key verified at the last sign-in.
+    #[serde(skip)]
+    pub org_key: Option<crate::identity::orgs::OrgKey>,
 }
 
 pub struct VerifiedLogin {
@@ -29,9 +32,14 @@ pub struct VerifiedLogin {
     pub email: Option<String>,
     pub name: Option<String>,
     pub group_admin: bool,
+    /// The verified organization key (B13).
+    pub org: crate::identity::orgs::OrgKey,
 }
 
 fn row_identity(r: &rusqlite::Row<'_>) -> rusqlite::Result<Identity> {
+    let kind: Option<String> = r.get(8)?;
+    let value: Option<String> = r.get(9)?;
+    let name: Option<String> = r.get(10)?;
     Ok(Identity {
         id: r.get(0)?,
         issuer: r.get(1)?,
@@ -41,18 +49,29 @@ fn row_identity(r: &rusqlite::Row<'_>) -> rusqlite::Result<Identity> {
         email: r.get(5)?,
         name: r.get(6)?,
         group_admin: r.get::<_, i64>(7)? != 0,
+        org_key: match (kind, value) {
+            (Some(kind), Some(value)) => Some(crate::identity::orgs::OrgKey {
+                name: name.unwrap_or_else(|| value.clone()),
+                kind,
+                value,
+            }),
+            _ => None,
+        },
     })
 }
 
-const IDENTITY_COLS: &str = "id, issuer, sub, provider_id, person_id, email, name, group_admin";
+const IDENTITY_COLS: &str = "id, issuer, sub, provider_id, person_id, email, name, group_admin, org_key_kind, org_key_value, org_key_name";
 
 /// Insert or refresh the identity row for (issuer, sub). Never looks at email.
 pub fn upsert_identity(conn: &Connection, login: &VerifiedLogin, now: i64) -> Result<Identity> {
     conn.execute(
-        "INSERT INTO identities (issuer, sub, provider_id, email, name, group_admin, created_at, last_login_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+        "INSERT INTO identities (issuer, sub, provider_id, email, name, group_admin, created_at, last_login_at,
+                                 org_key_kind, org_key_value, org_key_name)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9, ?10)
          ON CONFLICT (issuer, sub) DO UPDATE SET email = excluded.email, name = excluded.name,
-           group_admin = excluded.group_admin, last_login_at = excluded.last_login_at",
+           group_admin = excluded.group_admin, last_login_at = excluded.last_login_at,
+           org_key_kind = excluded.org_key_kind, org_key_value = excluded.org_key_value,
+           org_key_name = excluded.org_key_name",
         params![
             login.issuer,
             login.sub,
@@ -60,7 +79,10 @@ pub fn upsert_identity(conn: &Connection, login: &VerifiedLogin, now: i64) -> Re
             login.email,
             login.name,
             login.group_admin as i64,
-            now
+            now,
+            login.org.kind,
+            login.org.value,
+            login.org.name
         ],
     )?;
     let ident = conn.query_row(
@@ -125,10 +147,16 @@ pub fn handle_base(email: Option<&str>) -> String {
     }
 }
 
-/// First sign-in: create the person for an identity with a derived handle
-/// (`base`, then `base-2`, `base-3`, ... on collision). Idempotent: an
-/// identity that already has a person keeps it.
-pub fn ensure_person(conn: &mut Connection, identity_id: i64, now: i64) -> Result<i64> {
+/// First sign-in: create the person for an identity in organization `org_id`
+/// with a derived handle (`base`, then `base-2`, `base-3`, ... on collision
+/// within that organization only, so names never hint at other
+/// organizations). Idempotent: an identity that already has a person keeps it.
+pub fn ensure_person(
+    conn: &mut Connection,
+    identity_id: i64,
+    org_id: i64,
+    now: i64,
+) -> Result<i64> {
     let tx = conn.transaction()?;
     let row: Option<(Option<i64>, Option<String>)> = tx
         .query_row(
@@ -152,8 +180,8 @@ pub fn ensure_person(conn: &mut Connection, identity_id: i64, now: i64) -> Resul
             format!("{}{suffix}", keep.trim_end_matches('-'))
         };
         let taken: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM persons WHERE handle = ?1)",
-            [&candidate],
+            "SELECT EXISTS(SELECT 1 FROM persons WHERE handle = ?1 AND org_id = ?2)",
+            params![candidate, org_id],
             |r| r.get(0),
         )?;
         if !taken {
@@ -162,8 +190,8 @@ pub fn ensure_person(conn: &mut Connection, identity_id: i64, now: i64) -> Resul
         n += 1;
     };
     tx.execute(
-        "INSERT INTO persons (handle, created_at) VALUES (?1, ?2)",
-        params![handle, now],
+        "INSERT INTO persons (handle, org_id, created_at) VALUES (?1, ?2, ?3)",
+        params![handle, org_id, now],
     )?;
     let person_id = tx.last_insert_rowid();
     tx.execute(
@@ -174,17 +202,28 @@ pub fn ensure_person(conn: &mut Connection, identity_id: i64, now: i64) -> Resul
     Ok(person_id)
 }
 
-/// Admin action: attach the identity (issuer, sub) to an existing person.
-pub fn link_identity(conn: &Connection, issuer: &str, sub: &str, handle: &str) -> Result<()> {
+/// Admin action: attach the identity (issuer, sub) to an existing person of
+/// the admin's organization. An identity already belonging to a person of
+/// another organization cannot be moved (B13).
+pub fn link_identity(
+    conn: &Connection,
+    org_id: i64,
+    issuer: &str,
+    sub: &str,
+    handle: &str,
+) -> Result<()> {
     let person_id: i64 = conn
-        .query_row("SELECT id FROM persons WHERE handle = ?1", [handle], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT id FROM persons WHERE handle = ?1 AND org_id = ?2",
+            params![handle, org_id],
+            |r| r.get(0),
+        )
         .optional()?
         .ok_or(Error::NotFound)?;
     let n = conn.execute(
-        "UPDATE identities SET person_id = ?1 WHERE issuer = ?2 AND sub = ?3",
-        params![person_id, issuer, sub],
+        "UPDATE identities SET person_id = ?1 WHERE issuer = ?2 AND sub = ?3
+           AND (person_id IS NULL OR person_id IN (SELECT id FROM persons WHERE org_id = ?4))",
+        params![person_id, issuer, sub, org_id],
     )?;
     if n == 0 {
         return Err(Error::NotFound);
@@ -215,13 +254,24 @@ pub fn agent_get_or_create(
     )?)
 }
 
-/// Admin = configured (issuer, sub) pair or admin-group member at last sign-in.
-pub fn is_admin(cfg: &Config, ident: &Identity) -> bool {
-    ident.group_admin
-        || cfg
-            .admins
-            .iter()
-            .any(|a| a.issuer.trim_end_matches('/') == ident.issuer && a.sub == ident.sub)
+/// Instance operator = a configured (issuer, sub) pair (B13: can disable
+/// organizations). Room governance is always inside the person's own org.
+pub fn is_operator(cfg: &Config, ident: &Identity) -> bool {
+    cfg.admins
+        .iter()
+        .any(|a| a.issuer.trim_end_matches('/') == ident.issuer && a.sub == ident.sub)
+}
+
+/// Admin of the person's own organization: an org admin, a member of the
+/// provider's admin group at last sign-in, or an instance operator.
+pub fn is_admin(conn: &Connection, cfg: &Config, ident: &Identity, org_id: i64) -> Result<bool> {
+    if ident.group_admin || is_operator(cfg, ident) {
+        return Ok(true);
+    }
+    match ident.person_id {
+        Some(pid) => crate::identity::orgs::is_org_admin(conn, org_id, pid),
+        None => Ok(false),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -320,6 +370,11 @@ mod tests {
             email: Some(email.into()),
             name: None,
             group_admin: false,
+            org: crate::identity::orgs::OrgKey {
+                kind: "google_hd".into(),
+                value: "example.com".into(),
+                name: "example.com".into(),
+            },
         }
     }
 
@@ -329,23 +384,45 @@ mod tests {
         let handles = db
             .call(|c| {
                 let mut out = Vec::new();
+                let org = crate::identity::orgs::create_org(
+                    c,
+                    &crate::identity::orgs::OrgKey {
+                        kind: "google_hd".into(),
+                        value: "example.com".into(),
+                        name: "example.com".into(),
+                    },
+                    1,
+                )?;
+                let other = crate::identity::orgs::create_org(
+                    c,
+                    &crate::identity::orgs::OrgKey {
+                        kind: "google_hd".into(),
+                        value: "other.com".into(),
+                        name: "other.com".into(),
+                    },
+                    1,
+                )?;
                 for (sub, email) in [
                     ("1", "r.voronin@example.com"),
                     ("2", "r_voronin@other.com"),
                     ("3", "R-Voronin@third.com"),
                 ] {
                     let ident = upsert_identity(c, &login(sub, email), 1)?;
-                    let pid = ensure_person(c, ident.id, 1)?;
-                    assert_eq!(ensure_person(c, ident.id, 2)?, pid, "idempotent");
+                    let pid = ensure_person(c, ident.id, org, 1)?;
+                    assert_eq!(ensure_person(c, ident.id, org, 2)?, pid, "idempotent");
                     out.push(person_handle(c, pid)?.unwrap_or_default());
                 }
                 // A 32-char base with a suffix stays within 32 chars.
                 let long = format!("{}@x.io", "b".repeat(32));
                 for sub in ["4", "5"] {
                     let ident = upsert_identity(c, &login(sub, &long), 1)?;
-                    let pid = ensure_person(c, ident.id, 1)?;
+                    let pid = ensure_person(c, ident.id, org, 1)?;
                     out.push(person_handle(c, pid)?.unwrap_or_default());
                 }
+                // Names are unique per organization: another org may reuse one.
+                let ident = upsert_identity(c, &login("6", "r.voronin@other.com"), 1)?;
+                let pid = ensure_person(c, ident.id, other, 1)?;
+                out.push(person_handle(c, pid)?.unwrap_or_default());
                 Ok(out)
             })
             .await
@@ -355,6 +432,7 @@ mod tests {
         assert_eq!(handles[2], "r-voronin-3");
         assert_eq!(handles[3], "b".repeat(32));
         assert_eq!(handles[4], format!("{}-2", "b".repeat(30)));
+        assert_eq!(handles[5], "r-voronin", "no suffix across organizations");
         assert!(handles.iter().all(|h| h.len() <= MAX_HANDLE_LEN));
     }
 }
