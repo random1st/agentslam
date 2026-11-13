@@ -33,8 +33,18 @@ fn seqs(wait: &Value) -> Vec<i64> {
 async fn s5d_ac_uc_agentslam_sessions_restore() {
     let env = Env::start().await;
     let roman = env.agent("roman", "claude-pm").await;
-    roman.ok("room_create", json!({"name": "ios"})).await;
-    roman.ok("room_create", json!({"name": "backend"})).await;
+    roman
+        .ok(
+            "room_create",
+            json!({"name": "ios", "topic": "iOS release coordination"}),
+        )
+        .await;
+    roman
+        .ok(
+            "room_create",
+            json!({"name": "backend", "topic": "Backend API work"}),
+        )
+        .await;
     roman
         .ok("room_attach", json!({"room": "ios", "session": "S"}))
         .await;
@@ -70,7 +80,12 @@ async fn s5d_ac_uc_agentslam_sessions_restore() {
 async fn s5d_ac_uc_agentslam_sessions_new_session_empty() {
     let env = Env::start().await;
     let roman = env.agent("roman", "claude-pm").await;
-    roman.ok("room_create", json!({"name": "ios"})).await;
+    roman
+        .ok(
+            "room_create",
+            json!({"name": "ios", "topic": "iOS release coordination"}),
+        )
+        .await;
     roman
         .ok("room_attach", json!({"room": "ios", "session": "S"}))
         .await;
@@ -105,8 +120,18 @@ async fn s5d_ac_uc_agentslam_sessions_new_session_empty() {
 async fn s5d_ac_uc_agentslam_sessions_concurrent_isolated() {
     let env = Env::start().await;
     let roman = env.agent("roman", "claude-pm").await;
-    roman.ok("room_create", json!({"name": "ios"})).await;
-    roman.ok("room_create", json!({"name": "backend"})).await;
+    roman
+        .ok(
+            "room_create",
+            json!({"name": "ios", "topic": "iOS release coordination"}),
+        )
+        .await;
+    roman
+        .ok(
+            "room_create",
+            json!({"name": "backend", "topic": "Backend API work"}),
+        )
+        .await;
     // Two clients, same token, open at the same time.
     let s = roman.reconnect();
     let t = roman.reconnect();
@@ -153,7 +178,12 @@ async fn s5d_ac_uc_agentslam_sessions_concurrent_isolated() {
 async fn session_argument_is_required_and_validated() {
     let env = Env::start().await;
     let roman = env.agent("roman", "claude-pm").await;
-    roman.ok("room_create", json!({"name": "ios"})).await;
+    roman
+        .ok(
+            "room_create",
+            json!({"name": "ios", "topic": "iOS release coordination"}),
+        )
+        .await;
     let long = "a".repeat(129);
     for bad in [
         json!(null),

@@ -135,7 +135,10 @@ async fn s5d_ac_uc_agentslam_connect_cimd_login() {
         .await;
     assert_eq!(list["caller"], json!("roman/claude-pm"));
     let created = mcp
-        .ok("room_create", json!({"name": "ios", "owner": "alex"}))
+        .ok(
+            "room_create",
+            json!({"name": "ios", "topic": "iOS release coordination", "owner": "alex"}),
+        )
         .await;
     assert_eq!(created["owner"], json!("roman"));
 
@@ -340,7 +343,12 @@ async fn s5d_ac_uc_agentslam_connect_entra_tenant() {
 async fn s5d_ac_uc_agentslam_connect_no_email_merge() {
     let env = Env::start().await;
     let roman = env.agent("roman", "claude-pm").await;
-    roman.ok("room_create", json!({"name": "ios"})).await;
+    roman
+        .ok(
+            "room_create",
+            json!({"name": "ios", "topic": "iOS release coordination"}),
+        )
+        .await;
 
     let b = env.browser();
     env.entra

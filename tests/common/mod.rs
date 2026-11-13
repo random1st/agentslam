@@ -278,6 +278,8 @@ pub struct Env {
     pub entra_multi: FakeIdp,
     /// Generic OIDC provider with org_claim = org_id.
     pub oidc: FakeIdp,
+    /// Generic OIDC provider with a fixed organization "acme" (no claim).
+    pub oidc_fixed: FakeIdp,
     pub cimd: CimdServer,
     people: tokio::sync::Mutex<HashMap<String, Arc<Browser>>>,
 }
@@ -301,6 +303,7 @@ fn provider(id: &str, kind: ProviderKind, issuer: &str) -> ProviderConfig {
         admin_group: None,
         org_claim: None,
         org_map: Default::default(),
+        organization: None,
     }
 }
 
@@ -316,6 +319,7 @@ impl Env {
         let entra = FakeIdp::start("agentslam-entra").await;
         let entra_multi = FakeIdp::start("agentslam-entra-multi").await;
         let oidc = FakeIdp::start("agentslam-oidc").await;
+        let oidc_fixed = FakeIdp::start("agentslam-oidc-fixed").await;
         let cimd = CimdServer::start().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -329,13 +333,15 @@ impl Env {
         let em = provider("entra-multi", ProviderKind::Entra, &entra_multi.url);
         let mut oi = provider("oidc", ProviderKind::Oidc, &oidc.url);
         oi.org_claim = Some("org_id".into());
+        let mut of = provider("oidc-fixed", ProviderKind::Oidc, &oidc_fixed.url);
+        of.organization = Some("acme".into());
         let mut config = Config {
             bind: "127.0.0.1:0".parse().expect("addr"),
             public_url: base.clone(),
             database: ":memory:".into(),
             secure_cookies: false,
             allow_insecure_http_for_tests: true,
-            providers: vec![g, o, e, em, oi],
+            providers: vec![g, o, e, em, oi, of],
             oauth: OAuthConfig {
                 allowed_clients: vec![cimd.client("claude.json"), cimd.client("codex.json")],
                 ..OAuthConfig::default()
@@ -359,6 +365,7 @@ impl Env {
             entra,
             entra_multi,
             oidc,
+            oidc_fixed,
             cimd,
             people: Default::default(),
         }
@@ -370,6 +377,7 @@ impl Env {
             "okta" => &self.okta,
             "entra-multi" => &self.entra_multi,
             "oidc" => &self.oidc,
+            "oidc-fixed" => &self.oidc_fixed,
             _ => &self.entra,
         }
     }
@@ -430,7 +438,12 @@ impl Env {
     pub async fn ios_with_alex(&self) -> (Mcp, Mcp) {
         let roman = self.agent("roman", "claude-pm").await;
         let alex = self.agent("alex", "codex").await;
-        roman.ok("room_create", json!({"name": "ios"})).await;
+        roman
+            .ok(
+                "room_create",
+                json!({"name": "ios", "topic": "iOS release coordination"}),
+            )
+            .await;
         alex.ok("room_request_join", json!({"room": "ios"})).await;
         self.confirm_pending("roman", "ios", "alex/codex").await;
         (roman, alex)

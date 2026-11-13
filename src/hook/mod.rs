@@ -89,8 +89,9 @@ fn esc(s: &str) -> String {
 
 /// Wrap items for the model's context: messages and agent-written summaries
 /// as untrusted data; a summary request addressed to this agent as
-/// `<room-summary-request room=..>` (B6a). The server only ever delivers a
-/// request to the agent it is addressed to.
+/// `<room-summary-request room=..>` (B6a), a join request notice as
+/// `<room-join-request room=..>` (B5). The server only ever delivers these
+/// server items to the agent they are addressed to.
 pub fn format_messages(msgs: &[Message]) -> String {
     let mut out = String::new();
     if msgs.is_empty() {
@@ -101,6 +102,11 @@ pub fn format_messages(msgs: &[Message]) -> String {
         let item = match m.kind.as_str() {
             "summary_request" => format!(
                 "<room-summary-request room=\"{}\">\n{}\n</room-summary-request>\n",
+                esc(&m.room),
+                esc(&m.text)
+            ),
+            "join_request" => format!(
+                "<room-join-request room=\"{}\">\n{}\n</room-join-request>\n",
                 esc(&m.room),
                 esc(&m.text)
             ),
@@ -227,12 +233,16 @@ mod tests {
                 3,
             ),
             item("summary_request", "agentslam", "please summarize", 4),
+            item("join_request", "agentslam", "alex/codex asks to join", 5),
         ]);
         assert!(out.contains(
             "<room-summary room=\"ios\" from=\"alex/codex\" seq=\"2\" untrusted>\n- decided &lt;x&gt;\n</room-summary>"
         ));
         assert!(out.contains(
             "<room-summary-request room=\"ios\">\nplease summarize\n</room-summary-request>"
+        ));
+        assert!(out.contains(
+            "<room-join-request room=\"ios\">\nalex/codex asks to join\n</room-join-request>"
         ));
         assert!(
             out.contains(

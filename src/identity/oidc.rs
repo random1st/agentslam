@@ -359,6 +359,18 @@ pub fn check_company(
             ))
         }
         ProviderKind::Oidc => {
+            // A fixed organization: everyone signing in through this provider
+            // belongs to it, keyed by (issuer, name); no claim is read.
+            if let Some(name) = provider.organization.as_deref().map(str::trim) {
+                return Ok((
+                    false,
+                    OrgKey {
+                        kind: "oidc".into(),
+                        value: format!("{}#{name}", provider.issuer()),
+                        name: name.to_string(),
+                    },
+                ));
+            }
             let claim = provider.org_claim.as_deref().unwrap_or("org_id");
             let value = match claims.get(claim) {
                 Some(Value::String(s)) if !s.is_empty() => s.clone(),

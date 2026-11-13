@@ -136,6 +136,10 @@ pub struct ProviderConfig {
     /// oidc: optional explicit map claim value → organization key.
     #[serde(default)]
     pub org_map: std::collections::BTreeMap<String, String>,
+    /// oidc: one fixed organization for everyone signing in through this
+    /// provider, keyed by (issuer, name); no claim needed. Excludes `org_claim`.
+    #[serde(default)]
+    pub organization: Option<String>,
 }
 
 impl ProviderConfig {
@@ -333,11 +337,24 @@ impl Config {
                         "provider {} (oidc): issuer is required",
                         p.id
                     );
-                    ensure!(
-                        p.org_claim.as_deref().is_some_and(|c| !c.is_empty()),
-                        "provider {} (oidc): org_claim is required (the ID token claim naming the organization)",
-                        p.id
-                    );
+                    let fixed = p.organization.as_deref().map(str::trim);
+                    let claim = p.org_claim.as_deref().filter(|c| !c.is_empty());
+                    match (fixed, claim) {
+                        (Some(_), Some(_)) => bail!(
+                            "provider {} (oidc): set either organization (one fixed organization) or org_claim (organization from an ID token claim), not both",
+                            p.id
+                        ),
+                        (Some(name), None) => ensure!(
+                            !name.is_empty(),
+                            "provider {} (oidc): organization is empty",
+                            p.id
+                        ),
+                        (None, None) => bail!(
+                            "provider {} (oidc): org_claim (the ID token claim naming the organization) or organization (one fixed organization) is required",
+                            p.id
+                        ),
+                        (None, Some(_)) => {}
+                    }
                 }
             }
             let issuer = url::Url::parse(&p.issuer())
@@ -422,6 +439,21 @@ mod tests {
             Config::from_toml("bind='0.0.0.0:8787'\npublic_url='https://rooms.example.com'\n")
                 .unwrap();
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn oidc_organization_and_org_claim_are_exclusive() {
+        let base = "public_url='http://127.0.0.1:1'\n[[providers]]\nid='kc'\nkind='oidc'\nissuer='https://id.acme.test'\nclient_id='c'\n";
+        let check = |extra: &str| {
+            let mut cfg = Config::from_toml(&format!("{base}{extra}")).expect("parse");
+            cfg.providers[0].client_secret = Some("s".into());
+            cfg.validate()
+        };
+        assert!(check("organization='acme'\n").is_ok());
+        assert!(check("org_claim='org_id'\n").is_ok());
+        let both = check("organization='acme'\norg_claim='org_id'\n").unwrap_err();
+        assert!(format!("{both:#}").contains("not both"), "{both:#}");
+        assert!(check("").is_err(), "one of the two is required");
     }
 
     #[test]

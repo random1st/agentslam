@@ -61,9 +61,14 @@ client_secret_env = "AGENTSLAM_GOOGLE_SECRET"
 # issuer = "https://idp.example.com"
 # client_id = "agentslam"
 # client_secret_env = "AGENTSLAM_OIDC_SECRET"
-# org_claim = "org_id"               # ID token claim naming the organization (required)
+# org_claim = "org_id"               # ID token claim naming the organization
 # [providers.org_map]                # optional: claim value -> organization
 # "1234" = "acme"
+#
+# Or, instead of org_claim (never both): everyone who signs in through this
+# provider joins one fixed organization, keyed by (issuer, name); no claim is
+# needed (a company's own Keycloak, Authentik, Auth0, Zitadel).
+# organization = "acme"
 
 # Agent-written room summaries (no model runs on the server): every interval_s
 # the server asks one online member of each room with at least min_messages new

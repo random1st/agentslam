@@ -570,6 +570,7 @@ async fn resolve_provider(state: &Shared, id: &str) -> Option<(ProviderConfig, O
             admin_group: None,
             org_claim: None,
             org_map: Default::default(),
+            organization: None,
         },
         Some(org_id),
     ))

@@ -38,6 +38,8 @@ providers: []
 #    client_id: "agentslam"
 #    client_secret_env: AGENTSLAM_OIDC_SECRET
 #    org_claim: org_id
+#    # or, instead of org_claim (never both): one fixed organization, no claim needed
+#    # organization: acme
 
 # An existing Secret holding the provider client secrets, and how its keys map to
 # the environment variables named in client_secret_env. The chart never creates it.

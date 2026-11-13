@@ -45,6 +45,7 @@ pub fn routes() -> Router<Shared> {
         .route("/api/rooms/{name}/archive", post(archive))
         .route("/api/rooms/{name}/unarchive", post(unarchive))
         .route("/api/rooms/{name}/delete", post(delete))
+        .route("/api/rooms/{name}/topic", post(set_topic))
         .route("/api/agent-tokens", post(mint_token))
         .route("/api/credentials/{family}/revoke", post(revoke))
         .route("/api/admin/link", post(admin_link))
@@ -56,6 +57,8 @@ pub fn routes() -> Router<Shared> {
             "/api/operator/orgs/{id}/disable",
             post(operator_disable_org),
         )
+        .route("/api/operator/orgs/{id}/enable", post(operator_enable_org))
+        .route("/api/operator/orgs/{id}/admins", post(operator_add_admin))
 }
 
 fn asset(content_type: &'static str, body: &'static str) -> Response {
@@ -215,6 +218,24 @@ async fn delete(
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
     lifecycle(state, user, headers, name, "deleted").await
+}
+
+#[derive(Deserialize)]
+struct TopicRequest {
+    topic: String,
+}
+
+/// B4: the owner or an org admin changes the room topic.
+async fn set_topic(
+    State(state): State<Shared>,
+    user: WebUser,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(req): Json<TopicRequest>,
+) -> Result<Json<serde_json::Value>> {
+    check_csrf(&user.session, &headers, None)?;
+    service::set_topic(&state, person(&user), name, &req.topic).await?;
+    Ok(ok())
 }
 
 #[derive(Deserialize)]
@@ -466,28 +487,98 @@ async fn org_add_okta(
         .into_response())
 }
 
-/// Instance operators (config `admins`) list and disable organizations.
+/// Instance operators (config `admins`, the super admins, B13) list
+/// organizations, disable or re-enable one and name an admin in any of them.
+/// They never read another organization's rooms or messages: every room view
+/// stays scoped to the operator's own organization.
+fn require_operator(user: &WebUser) -> Result<()> {
+    if user.session.is_operator {
+        Ok(())
+    } else {
+        Err(Error::Forbidden("instance operators only".into()))
+    }
+}
+
 async fn operator_orgs(
     State(state): State<Shared>,
     user: WebUser,
 ) -> Result<Json<serde_json::Value>> {
-    if !user.session.is_operator {
-        return Err(Error::Forbidden("instance operators only".into()));
-    }
+    require_operator(&user)?;
     let orgs: Vec<serde_json::Value> = state
         .db
         .call(|c| {
             let mut s = c.prepare(
-                "SELECT id, name, key_kind, disabled_at IS NOT NULL FROM organizations ORDER BY name",
+                "SELECT o.id, o.name, o.key_kind, o.disabled_at IS NOT NULL,
+                   (SELECT group_concat(handle, ', ') FROM (SELECT p.handle FROM org_admins a
+                      JOIN persons p ON p.id = a.person_id WHERE a.org_id = o.id ORDER BY p.handle))
+                 FROM organizations o ORDER BY o.name",
             )?;
             Ok(s.query_map([], |r| {
-                Ok(json!({"id": r.get::<_, i64>(0)?, "name": r.get::<_, String>(1)?,
-                          "kind": r.get::<_, String>(2)?, "disabled": r.get::<_, bool>(3)?}))
+                let admins: Option<String> = r.get(4)?;
+                let admins: Vec<&str> = admins
+                    .as_deref()
+                    .map(|a| a.split(", ").collect())
+                    .unwrap_or_default();
+                Ok(
+                    json!({"id": r.get::<_, i64>(0)?, "name": r.get::<_, String>(1)?,
+                          "kind": r.get::<_, String>(2)?, "disabled": r.get::<_, bool>(3)?,
+                          "admins": admins}),
+                )
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?)
         })
         .await?;
     Ok(Json(json!({"organizations": orgs})))
+}
+
+async fn operator_enable_org(
+    State(state): State<Shared>,
+    user: WebUser,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>> {
+    check_csrf(&user.session, &headers, None)?;
+    require_operator(&user)?;
+    state
+        .db
+        .call(move |c| {
+            let n = c.execute(
+                "UPDATE organizations SET disabled_at = NULL WHERE id = ?1 AND disabled_at IS NOT NULL",
+                [id],
+            )?;
+            if n == 0 {
+                return Err(Error::NotFound);
+            }
+            Ok(())
+        })
+        .await?;
+    Ok(ok())
+}
+
+/// An operator names an existing person of organization `id` as its admin.
+async fn operator_add_admin(
+    State(state): State<Shared>,
+    user: WebUser,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(req): Json<AdminRequest>,
+) -> Result<Json<serde_json::Value>> {
+    check_csrf(&user.session, &headers, None)?;
+    require_operator(&user)?;
+    let now = state.clock.now();
+    state
+        .db
+        .call(move |c| {
+            let pid: i64 = rusqlite::OptionalExtension::optional(c.query_row(
+                "SELECT id FROM persons WHERE handle = ?1 AND org_id = ?2",
+                rusqlite::params![req.handle.trim(), id],
+                |r| r.get(0),
+            ))?
+            .ok_or(Error::NotFound)?;
+            crate::identity::orgs::add_admin(c, id, pid, now)
+        })
+        .await?;
+    Ok(ok())
 }
 
 async fn operator_disable_org(
@@ -497,9 +588,7 @@ async fn operator_disable_org(
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>> {
     check_csrf(&user.session, &headers, None)?;
-    if !user.session.is_operator {
-        return Err(Error::Forbidden("instance operators only".into()));
-    }
+    require_operator(&user)?;
     let now = state.clock.now();
     let agents: Vec<i64> = state
         .db

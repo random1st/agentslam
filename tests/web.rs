@@ -90,7 +90,12 @@ async fn s5d_ac_uc_agentslam_web_live_stream() {
 async fn s5d_ac_uc_agentslam_web_web_scope() {
     let env = Env::start().await;
     let roman = env.agent("roman", "claude-pm").await;
-    roman.ok("room_create", json!({"name": "ios"})).await;
+    roman
+        .ok(
+            "room_create",
+            json!({"name": "ios", "topic": "iOS release coordination"}),
+        )
+        .await;
     roman
         .ok("room_send", json!({"room": "ios", "text": "ROMAN-ONLY"}))
         .await;
@@ -119,7 +124,12 @@ async fn s5d_ac_uc_agentslam_web_csrf() {
     let env = Env::start().await;
     let roman = env.agent("roman", "claude-pm").await;
     let alex = env.agent("alex", "codex").await;
-    roman.ok("room_create", json!({"name": "ios"})).await;
+    roman
+        .ok(
+            "room_create",
+            json!({"name": "ios", "topic": "iOS release coordination"}),
+        )
+        .await;
     alex.ok("room_request_join", json!({"room": "ios"})).await;
     let owner = env.person("roman").await;
     let id = owner.pending_request_id("ios", "alex/codex").await;
@@ -199,7 +209,12 @@ async fn s5d_ac_uc_agentslam_web_delete_room() {
         "room_not_found"
     );
     // The name is free again.
-    roman.ok("room_create", json!({"name": "ios"})).await;
+    roman
+        .ok(
+            "room_create",
+            json!({"name": "ios", "topic": "iOS release coordination"}),
+        )
+        .await;
 }
 
 /// Not an acceptance criterion (B11 UX): pending requests lead the page and are
@@ -209,8 +224,18 @@ async fn rooms_page_ux_contract() {
     let env = Env::start().await;
     let roman = env.agent("roman", "claude-pm").await;
     let alex = env.agent("alex", "codex").await;
-    roman.ok("room_create", json!({"name": "ios"})).await;
-    roman.ok("room_create", json!({"name": "backend"})).await;
+    roman
+        .ok(
+            "room_create",
+            json!({"name": "ios", "topic": "iOS release coordination"}),
+        )
+        .await;
+    roman
+        .ok(
+            "room_create",
+            json!({"name": "backend", "topic": "Backend API work"}),
+        )
+        .await;
     alex.ok("room_request_join", json!({"room": "ios"})).await;
     alex.ok("room_request_join", json!({"room": "backend"}))
         .await;

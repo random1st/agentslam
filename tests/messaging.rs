@@ -70,7 +70,12 @@ async fn s5d_ac_uc_agentslam_messaging_non_member_blocked() {
     let env = Env::start().await;
     let roman = env.agent("roman", "claude-pm").await;
     let alex = env.agent("alex", "codex").await;
-    roman.ok("room_create", json!({"name": "ios"})).await;
+    roman
+        .ok(
+            "room_create",
+            json!({"name": "ios", "topic": "iOS release coordination"}),
+        )
+        .await;
     roman
         .ok("room_send", json!({"room": "ios", "text": "PRIVATE-1"}))
         .await;
@@ -110,7 +115,12 @@ async fn s5d_ac_uc_agentslam_messaging_history_cap() {
     let env = Env::start().await;
     let roman = env.agent("roman", "claude-pm").await;
     let alex = env.agent("alex", "codex").await;
-    roman.ok("room_create", json!({"name": "ios"})).await;
+    roman
+        .ok(
+            "room_create",
+            json!({"name": "ios", "topic": "iOS release coordination"}),
+        )
+        .await;
     let send_up_to = |n: i64| {
         let roman = &roman;
         async move {
@@ -134,7 +144,9 @@ async fn s5d_ac_uc_agentslam_messaging_history_cap() {
     send_up_to(20).await;
     alex.ok("room_request_join", json!({"room": "ios"})).await;
     env.confirm_pending("roman", "ios", "alex/codex").await;
-    send_up_to(22).await;
+    // The request posted a join_request item to roman/claude-pm at 21 (B5),
+    // so the re-admission is after 21; alex sees neither it nor anything earlier.
+    send_up_to(23).await;
 
     let read = alex
         .ok("room_read", json!({"room": "ios", "since": 0}))
@@ -147,7 +159,7 @@ async fn s5d_ac_uc_agentslam_messaging_history_cap() {
         .collect();
     assert_eq!(
         seqs,
-        vec![21, 22],
+        vec![22, 23],
         "only messages after the current admission"
     );
     let read = alex
@@ -166,7 +178,12 @@ async fn s5d_ac_uc_agentslam_messaging_history_cap() {
 async fn s5d_ac_uc_agentslam_messaging_send_validation() {
     let env = Env::start().await;
     let roman = env.agent("roman", "claude-pm").await;
-    roman.ok("room_create", json!({"name": "ios"})).await;
+    roman
+        .ok(
+            "room_create",
+            json!({"name": "ios", "topic": "iOS release coordination"}),
+        )
+        .await;
     assert_eq!(
         roman
             .err("room_send", json!({"room": "ios", "text": ""}))
@@ -426,7 +443,14 @@ async fn s5d_ac_uc_agentslam_messaging_request_policy() {
             assert!(p.contains(m), "{what} policy: {m}");
         }
     }
-    assert_eq!(read["messages"][0]["kind"], json!("message"));
+    // First the join_request notice about alex (B5), then the message.
+    let kinds: Vec<&str> = read["messages"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter_map(|m| m["kind"].as_str())
+        .collect();
+    assert_eq!(kinds, vec!["join_request", "message"]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -434,7 +458,12 @@ async fn s5d_ac_uc_agentslam_messaging_join_summary() {
     let env = Env::start().await;
     let roman = env.agent("roman", "claude-pm").await;
     let codex = env.agent("roman", "codex").await;
-    roman.ok("room_create", json!({"name": "ios"})).await;
+    roman
+        .ok(
+            "room_create",
+            json!({"name": "ios", "topic": "iOS release coordination"}),
+        )
+        .await;
     send_n(&roman, "ios", 20, "early").await;
     let s = roman
         .ok(
@@ -445,8 +474,10 @@ async fn s5d_ac_uc_agentslam_messaging_join_summary() {
     assert_eq!(s["seq"], json!(21));
     assert_eq!(s["kind"], json!("summary"));
     send_n(&roman, "ios", 4, "late").await; // 22..25
-    codex.ok("room_request_join", json!({"room": "ios"})).await;
-    env.confirm_pending("roman", "ios", "roman/codex").await;
+    // An agent of the owner's own person is admitted at once (B5), at the
+    // current end of the room (admission after 25).
+    let join = codex.ok("room_request_join", json!({"room": "ios"})).await;
+    assert_eq!(join["status"], json!("member"));
 
     let read = codex
         .ok("room_read", json!({"room": "ios", "since": 0}))

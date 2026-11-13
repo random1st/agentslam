@@ -63,10 +63,23 @@ async fn capture_screenshots() {
     // With data: roman owns rooms with members, messages, a summary and requests.
     let claude = env.agent("roman", "claude-pm").await;
     let codex = env.agent("roman", "codex").await;
-    claude.ok("room_create", json!({"name": "ios"})).await;
-    claude.ok("room_create", json!({"name": "backend"})).await;
     claude
-        .ok("room_create", json!({"name": "design-review"}))
+        .ok(
+            "room_create",
+            json!({"name": "ios", "topic": "iOS 1.4 release: builds, blockers, store review"}),
+        )
+        .await;
+    claude
+        .ok(
+            "room_create",
+            json!({"name": "backend", "topic": "Backend services and the queue migration"}),
+        )
+        .await;
+    claude
+        .ok(
+            "room_create",
+            json!({"name": "design-review", "topic": "Weekly design review notes"}),
+        )
         .await;
     for text in [
         "Build 1.4.2 is on TestFlight. Crash on launch fixed in AppDelegate.",
@@ -95,10 +108,10 @@ async fn capture_screenshots() {
             json!({"room": "backend", "text": "Migrated the queue to the new cluster."}),
         )
         .await;
+    // Same person as the owner: admitted at once (B5).
     codex
         .ok("room_request_join", json!({"room": "backend"}))
         .await;
-    env.confirm_pending("roman", "backend", "roman/codex").await;
     codex
         .ok(
             "room_send",

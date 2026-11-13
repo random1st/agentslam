@@ -21,6 +21,8 @@ pub enum Error {
     InvalidText,
     #[error("invalid_name")]
     InvalidName,
+    #[error("invalid_topic")]
+    InvalidTopic,
     #[error("invalid_session")]
     InvalidSession,
     #[error("unauthorized")]
@@ -50,6 +52,7 @@ impl Error {
             Error::RoomArchived => "room_archived",
             Error::InvalidText => "invalid_text",
             Error::InvalidName => "invalid_name",
+            Error::InvalidTopic => "invalid_topic",
             Error::InvalidSession => "invalid_session",
             Error::Unauthorized => "unauthorized",
             Error::Forbidden(_) => "forbidden",
@@ -68,6 +71,7 @@ impl Error {
             Error::RoomArchived => StatusCode::CONFLICT,
             Error::InvalidText
             | Error::InvalidName
+            | Error::InvalidTopic
             | Error::InvalidSession
             | Error::BadRequest(_) => StatusCode::BAD_REQUEST,
             Error::Unauthorized => StatusCode::UNAUTHORIZED,

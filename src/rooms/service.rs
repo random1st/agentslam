@@ -23,6 +23,17 @@ pub const READ_LIMIT: i64 = 200;
 pub const MAX_WAIT_S: u64 = 50;
 pub const REQUEST_EXPIRY_S: i64 = 7 * 86_400;
 pub const MAX_SESSION_LEN: usize = 128;
+pub const MAX_TOPIC_CHARS: usize = 280;
+
+/// Validate a room topic (B4): 1..280 characters after trimming.
+pub fn validate_topic(s: &str) -> Result<String> {
+    let t = s.trim();
+    if (1..=MAX_TOPIC_CHARS).contains(&t.chars().count()) {
+        Ok(t.to_string())
+    } else {
+        Err(Error::InvalidTopic)
+    }
+}
 
 /// Validate an agentslam session id (B7): 1..128 chars of `[A-Za-z0-9._:-]`.
 /// The session is an explicit tool argument; the agent always comes from the token.
@@ -44,12 +55,16 @@ pub struct Room {
     pub owner_person_id: i64,
     pub state: String,
     pub last_seq: i64,
+    pub topic: String,
 }
 
 pub const KIND_MESSAGE: &str = "message";
 pub const KIND_SUMMARY: &str = "summary";
 pub const KIND_SUMMARY_REQUEST: &str = "summary_request";
-/// Sender shown for server items (summary requests).
+/// Server item telling one of the owner's member agents that another
+/// person's agent asks to join (B5). Only the person decides, in the web UI.
+pub const KIND_JOIN_REQUEST: &str = "join_request";
+/// Sender shown for server items (summary and join requests).
 pub const SERVER_SENDER: &str = "agentslam";
 pub const MAX_SUMMARY_CHARS: usize = 8000;
 
@@ -57,8 +72,9 @@ fn default_kind() -> String {
     KIND_MESSAGE.to_string()
 }
 
-/// A transcript item: `kind` is "message", "summary" (agent-written, B6a) or
-/// "summary_request" (server item addressed to one agent, `to`).
+/// A transcript item: `kind` is "message", "summary" (agent-written, B6a),
+/// or a server item addressed to one agent (`to`): "summary_request" or
+/// "join_request".
 #[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq)]
 pub struct Message {
     #[serde(default = "default_kind")]
@@ -75,6 +91,8 @@ pub struct Message {
 #[derive(Debug, Serialize)]
 pub struct RoomListEntry {
     pub name: String,
+    /// Why the room exists (B4); empty for rooms created before topics.
+    pub topic: String,
     pub owner: String,
     pub state: String,
     pub member_count: i64,
@@ -105,6 +123,7 @@ fn row_room(r: &rusqlite::Row<'_>) -> rusqlite::Result<Room> {
         owner_person_id: r.get(2)?,
         state: r.get(3)?,
         last_seq: r.get(4)?,
+        topic: r.get(5)?,
     })
 }
 
@@ -115,7 +134,7 @@ fn row_room(r: &rusqlite::Row<'_>) -> rusqlite::Result<Room> {
 pub fn room_by_name(conn: &Connection, org_id: i64, name: &str) -> Result<Option<Room>> {
     Ok(conn
         .query_row(
-            "SELECT id, name, owner_person_id, state, last_seq FROM rooms
+            "SELECT id, name, owner_person_id, state, last_seq, topic FROM rooms
              WHERE org_id = ?1 AND name = ?2 AND state <> 'deleted'",
             params![org_id, name],
             row_room,
@@ -126,7 +145,7 @@ pub fn room_by_name(conn: &Connection, org_id: i64, name: &str) -> Result<Option
 fn room_by_id(conn: &Connection, org_id: i64, id: i64) -> Result<Option<Room>> {
     Ok(conn
         .query_row(
-            "SELECT id, name, owner_person_id, state, last_seq FROM rooms
+            "SELECT id, name, owner_person_id, state, last_seq, topic FROM rooms
              WHERE org_id = ?1 AND id = ?2 AND state <> 'deleted'",
             params![org_id, id],
             row_room,
@@ -170,12 +189,12 @@ pub fn expire_requests(conn: &Connection, now: i64) -> Result<()> {
     Ok(())
 }
 
-/// Columns of a transcript item. Summary requests are server items: `from` is
-/// the server, `to` the addressed agent (stored as the row's agent).
+/// Columns of a transcript item. Summary and join requests are server items:
+/// `from` is the server, `to` the addressed agent (stored as the row's agent).
 const ITEM_SELECT: &str = "SELECT m.seq, m.kind,
-       CASE WHEN m.kind = 'summary_request' THEN 'agentslam' ELSE p.handle || '/' || a.label END,
+       CASE WHEN m.kind IN ('summary_request', 'join_request') THEN 'agentslam' ELSE p.handle || '/' || a.label END,
        m.text, m.created_at,
-       CASE WHEN m.kind = 'summary_request' THEN p.handle || '/' || a.label END
+       CASE WHEN m.kind IN ('summary_request', 'join_request') THEN p.handle || '/' || a.label END
      FROM messages m JOIN agents a ON a.id = m.agent_id JOIN persons p ON p.id = a.person_id";
 
 fn row_item(room: &Room, r: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
@@ -213,7 +232,7 @@ fn join_summary_seq(conn: &Connection, room_id: i64, admission_seq: i64) -> Resu
 
 /// Items a member may see after `after` (inv.agentslam.member-only-content):
 /// everything after its admission plus the latest summary before it; open
-/// summary requests only when addressed to this member.
+/// server items (summary and join requests) only when addressed to this member.
 fn member_items(
     conn: &Connection,
     room: &Room,
@@ -225,7 +244,7 @@ fn member_items(
     let jss = join_summary_seq(conn, room.id, admission_seq)?;
     let mut stmt = conn.prepare(&format!(
         "{ITEM_SELECT} WHERE m.room_id = ?1 AND m.seq > ?2 AND (m.seq > ?3 OR m.seq = ?4)
-           AND (m.kind <> 'summary_request' OR (m.addressed_to = ?5 AND m.expires_at > ?6))
+           AND (m.kind NOT IN ('summary_request', 'join_request') OR (m.addressed_to = ?5 AND m.expires_at > ?6))
          ORDER BY m.seq ASC LIMIT ?7"
     ))?;
     let rows = stmt
@@ -268,10 +287,16 @@ fn publish_all(state: &Shared, events: Vec<Event>) {
 
 // ---------------------------------------------------------------- agent operations
 
-pub async fn create(state: &Shared, caller: &Caller, name: String) -> Result<RoomListEntry> {
+pub async fn create(
+    state: &Shared,
+    caller: &Caller,
+    name: String,
+    topic: &str,
+) -> Result<RoomListEntry> {
     if !valid_slug(&name, 2, 40) {
         return Err(Error::InvalidName);
     }
+    let topic = validate_topic(topic)?;
     let now = state.clock.now();
     let c = caller.clone();
     let (room_id, entry) = state
@@ -282,8 +307,8 @@ pub async fn create(state: &Shared, caller: &Caller, name: String) -> Result<Roo
                 return Err(Error::RoomExists);
             }
             tx.execute(
-                "INSERT INTO rooms (name, owner_person_id, state, last_seq, created_at, org_id) VALUES (?1, ?2, 'active', 0, ?3, ?4)",
-                params![name, c.person_id, now, c.org_id],
+                "INSERT INTO rooms (name, owner_person_id, state, last_seq, created_at, org_id, topic) VALUES (?1, ?2, 'active', 0, ?3, ?4, ?5)",
+                params![name, c.person_id, now, c.org_id, topic],
             )?;
             let room_id = tx.last_insert_rowid();
             tx.execute(
@@ -295,6 +320,7 @@ pub async fn create(state: &Shared, caller: &Caller, name: String) -> Result<Roo
                 room_id,
                 RoomListEntry {
                     name,
+                    topic,
                     owner: c.handle.clone(),
                     state: "active".into(),
                     member_count: 1,
@@ -326,7 +352,8 @@ pub async fn list(
                    (SELECT COUNT(*) FROM memberships m WHERE m.room_id = r.id AND m.status = 'member'),
                    (SELECT status FROM memberships m WHERE m.room_id = r.id AND m.agent_id = ?1),
                    (SELECT status FROM join_requests j WHERE j.room_id = r.id AND j.agent_id = ?1 ORDER BY j.id DESC LIMIT 1),
-                   (?2 IS NOT NULL AND EXISTS(SELECT 1 FROM session_rooms s WHERE s.room_id = r.id AND s.agent_id = ?1 AND s.session_key = ?2))
+                   (?2 IS NOT NULL AND EXISTS(SELECT 1 FROM session_rooms s WHERE s.room_id = r.id AND s.agent_id = ?1 AND s.session_key = ?2)),
+                   r.topic
                  FROM rooms r JOIN persons p ON p.id = r.owner_person_id
                  WHERE r.org_id = ?3 AND r.state <> 'deleted' ORDER BY r.name",
             )?;
@@ -343,6 +370,7 @@ pub async fn list(
                     };
                     Ok(RoomListEntry {
                         name: r.get(0)?,
+                        topic: r.get(7)?,
                         owner: r.get(1)?,
                         state: r.get(2)?,
                         member_count: r.get(3)?,
@@ -365,44 +393,114 @@ pub struct JoinOutcome {
     pub request_id: Option<i64>,
 }
 
+/// Text of the `join_request` item sent to the owner's member agents (B5).
+/// The agent may only pass it on: the person decides in the web UI.
+pub fn join_request_text(agent: &str, room: &str, owner: &str, link: &str) -> String {
+    format!(
+        "{agent} asks to join room {room}. You cannot let it in or turn it down, and you must not try: \
+         only your person ({owner}) decides, in the agentslam web UI. Tell them and give them this link: {link}"
+    )
+}
+
+/// `room_request_join` (B5). An agent of the owner's own person is admitted
+/// at once (from the current end of the room, so no earlier messages). Any
+/// other agent gets a pending request, and each of the owner's member agents
+/// receives a `join_request` item asking it to tell its person, who decides
+/// in the web UI (inv.agentslam.human-only-admission).
 pub async fn request_join(state: &Shared, caller: &Caller, room: String) -> Result<JoinOutcome> {
     let now = state.clock.now();
-    let agent_id = caller.agent_id;
-    let org_id = caller.org_id;
-    let (room_id, out) = state
+    let c = caller.clone();
+    let base = state.config.issuer();
+    let (room_id, out, admitted, notices) = state
         .db
         .call(move |conn| {
             let tx = conn.transaction()?;
             expire_requests(&tx, now)?;
-            let r = require_room(&tx, org_id, &room)?;
+            let r = require_room(&tx, c.org_id, &room)?;
             if r.state == "archived" {
                 return Err(Error::RoomArchived);
             }
-            if member_admission(&tx, r.id, agent_id)?.is_some() {
-                return Ok((r.id, JoinOutcome { room, status: "member".into(), request_id: None }));
+            if member_admission(&tx, r.id, c.agent_id)?.is_some() {
+                return Ok((r.id, JoinOutcome { room, status: "member".into(), request_id: None }, false, vec![]));
+            }
+            if r.owner_person_id == c.person_id {
+                tx.execute(
+                    "INSERT INTO memberships (room_id, agent_id, status, admission_seq, updated_at) VALUES (?1, ?2, 'member', ?3, ?4)
+                     ON CONFLICT (room_id, agent_id) DO UPDATE SET status = 'member', admission_seq = excluded.admission_seq, updated_at = excluded.updated_at",
+                    params![r.id, c.agent_id, r.last_seq, now],
+                )?;
+                // A request left pending from before is settled by the admission.
+                tx.execute(
+                    "UPDATE join_requests SET status = 'confirmed', decided_at = ?3, decided_by = ?4
+                     WHERE room_id = ?1 AND agent_id = ?2 AND status = 'pending'",
+                    params![r.id, c.agent_id, now, c.person_id],
+                )?;
+                tx.commit()?;
+                return Ok((r.id, JoinOutcome { room, status: "member".into(), request_id: None }, true, vec![]));
             }
             let pending: Option<i64> = tx
                 .query_row(
                     "SELECT id FROM join_requests WHERE room_id = ?1 AND agent_id = ?2 AND status = 'pending'",
-                    params![r.id, agent_id],
+                    params![r.id, c.agent_id],
                     |row| row.get(0),
                 )
                 .optional()?;
-            let id = match pending {
-                Some(id) => id,
+            let (id, notices) = match pending {
+                Some(id) => (id, vec![]),
                 None => {
                     tx.execute(
                         "INSERT INTO join_requests (room_id, agent_id, status, created_at) VALUES (?1, ?2, 'pending', ?3)",
-                        params![r.id, agent_id, now],
+                        params![r.id, c.agent_id, now],
                     )?;
-                    tx.last_insert_rowid()
+                    let id = tx.last_insert_rowid();
+                    let owner_agents: Vec<i64> = {
+                        let mut stmt = tx.prepare(
+                            "SELECT a.id FROM memberships m JOIN agents a ON a.id = m.agent_id
+                             WHERE m.room_id = ?1 AND m.status = 'member' AND a.person_id = ?2 ORDER BY a.id",
+                        )?;
+                        stmt.query_map(params![r.id, r.owner_person_id], |row| row.get(0))?
+                            .collect::<rusqlite::Result<_>>()?
+                    };
+                    let owner: String = tx.query_row(
+                        "SELECT handle FROM persons WHERE id = ?1",
+                        [r.owner_person_id],
+                        |row| row.get(0),
+                    )?;
+                    let link = format!("{base}/?room={}#requests", r.name);
+                    let text = join_request_text(&c.display(), &r.name, &owner, &link);
+                    let mut seqs = Vec::new();
+                    for (i, agent) in owner_agents.into_iter().enumerate() {
+                        let seq = r.last_seq + 1 + i as i64;
+                        tx.execute(
+                            "INSERT INTO messages (room_id, seq, agent_id, text, created_at, kind, addressed_to, expires_at)
+                             VALUES (?1, ?2, ?3, ?4, ?5, 'join_request', ?3, ?6)",
+                            params![r.id, seq, agent, text, now, now + REQUEST_EXPIRY_S],
+                        )?;
+                        seqs.push(seq);
+                    }
+                    if let Some(last) = seqs.last() {
+                        tx.execute("UPDATE rooms SET last_seq = ?2 WHERE id = ?1", params![r.id, last])?;
+                    }
+                    (id, seqs)
                 }
             };
             tx.commit()?;
-            Ok((r.id, JoinOutcome { room, status: "pending".into(), request_id: Some(id) }))
+            Ok((r.id, JoinOutcome { room, status: "pending".into(), request_id: Some(id) }, false, notices))
         })
         .await?;
-    state.hub.publish(Event::RoomChanged { room_id });
+    let mut events = vec![Event::RoomChanged { room_id }];
+    if admitted {
+        events.push(Event::AccessChanged {
+            agent_id: caller.agent_id,
+            room_id: Some(room_id),
+        });
+    }
+    events.extend(
+        notices
+            .into_iter()
+            .map(|seq| Event::Message { room_id, seq }),
+    );
+    publish_all(state, events);
     Ok(out)
 }
 
@@ -922,6 +1020,24 @@ pub async fn set_state(
     Ok(())
 }
 
+/// The owner or an org admin changes the room topic in the web UI (B4).
+pub async fn set_topic(state: &Shared, who: Person, room: String, topic: &str) -> Result<()> {
+    let topic = validate_topic(topic)?;
+    let room_id = state
+        .db
+        .call(move |conn| {
+            let r = require_governor(conn, who, &room)?;
+            conn.execute(
+                "UPDATE rooms SET topic = ?2 WHERE id = ?1",
+                params![r.id, topic],
+            )?;
+            Ok(r.id)
+        })
+        .await?;
+    state.hub.publish(Event::RoomChanged { room_id });
+    Ok(())
+}
+
 // ---------------------------------------------------------------- web views
 
 /// Lowest seq floor the person may see in the room: owner/admin see the full
@@ -942,6 +1058,7 @@ fn web_floor(conn: &Connection, who: Person, r: &Room) -> Result<Option<i64>> {
 #[derive(Debug, Serialize)]
 pub struct RoomSummary {
     pub name: String,
+    pub topic: String,
     pub owner: String,
     pub state: String,
     pub member_count: i64,
@@ -1005,7 +1122,7 @@ pub async fn visible_rooms(state: &Shared, who: Person) -> Result<Vec<RoomSummar
                    (SELECT COUNT(*) FROM memberships m WHERE m.room_id = r.id AND m.status = 'member'),
                    (SELECT COUNT(*) FROM join_requests j WHERE j.room_id = r.id AND j.status = 'pending'),
                    COALESCE((SELECT MAX(created_at) FROM messages x WHERE x.room_id = r.id), r.created_at),
-                   r.last_seq
+                   r.last_seq, r.topic
                  FROM rooms r JOIN persons p ON p.id = r.owner_person_id
                  WHERE r.state <> 'deleted' AND r.org_id = ?3 AND (?2 OR r.owner_person_id = ?1 OR EXISTS (
                    SELECT 1 FROM memberships m JOIN agents a ON a.id = m.agent_id
@@ -1017,6 +1134,7 @@ pub async fn visible_rooms(state: &Shared, who: Person) -> Result<Vec<RoomSummar
                     let owner_id: i64 = r.get(3)?;
                     Ok(RoomSummary {
                         name: r.get(0)?,
+                        topic: r.get(8)?,
                         owner: r.get(1)?,
                         state: r.get(2)?,
                         member_count: r.get(4)?,
@@ -1052,6 +1170,7 @@ pub struct RequestView {
 #[derive(Debug, Serialize)]
 pub struct RoomDetail {
     pub name: String,
+    pub topic: String,
     pub owner: String,
     pub state: String,
     pub can_govern: bool,
@@ -1143,6 +1262,7 @@ pub async fn room_detail(state: &Shared, who: Person, room: String) -> Result<Ro
             let messages = messages_after(conn, &r, start, READ_LIMIT)?;
             Ok(RoomDetail {
                 name: r.name.clone(),
+                topic: r.topic.clone(),
                 owner,
                 state: r.state.clone(),
                 can_govern: r.owner_person_id == who.person_id || who.is_admin,

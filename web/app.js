@@ -269,15 +269,32 @@ async function loadOperator() {
   $("operator-panel").hidden = false;
   const ul = el("ul", { class: "list" });
   for (const o of data.organizations) {
-    const li = el("li", {}, el("div", { class: "grow" }, el("strong", {}, o.name), " ", o.disabled ? el("span", { class: "badge plain" }, "Disabled") : null));
+    const li = el("li", {}, el("div", { class: "grow" }, el("strong", {}, o.name), " ", o.disabled ? el("span", { class: "badge plain" }, "Disabled") : null,
+      el("div", { class: "meta" }, "Admins: ", o.admins && o.admins.length ? o.admins.join(", ") : "none")));
+    const acts = el("div", { class: "actions" });
     if (!o.disabled) {
-      const b = el("button", { type: "button", class: "small-btn" }, "Disable…");
+      const b = el("button", { type: "button", class: "small-btn", "aria-label": `Disable ${o.name}` }, "Disable…");
       b.addEventListener("click", async () => {
-        const yes = await confirmAction({ title: `Disable ${o.name}?`, body: `Everyone in ${o.name} and all of its agents are signed out at once and can't sign in again.`, ok: `Disable ${o.name}` });
+        const yes = await confirmAction({ title: `Disable ${o.name}?`, body: `Everyone in ${o.name} and all of its agents are signed out at once and can't sign in again until you enable it.`, ok: `Disable ${o.name}` });
         if (yes && await act(b, `/api/operator/orgs/${o.id}/disable`, undefined, `${o.name} is disabled.`)) loadOperator();
       });
-      li.append(b);
+      acts.append(b);
+    } else {
+      const b = el("button", { type: "button", class: "small-btn", "aria-label": `Enable ${o.name}` }, "Enable");
+      b.addEventListener("click", async () => { if (await act(b, `/api/operator/orgs/${o.id}/enable`, undefined, `${o.name} is enabled again.`)) loadOperator(); });
+      acts.append(b);
     }
+    const inputId = `op-admin-${o.id}`;
+    const form = el("form", { class: "inline-form", novalidate: true },
+      el("div", { class: "field" }, el("label", { for: inputId }, `Name an admin of ${o.name}`),
+        el("input", { id: inputId, placeholder: "their name in agentslam", autocomplete: "off" })),
+      el("button", { type: "submit", class: "small-btn" }, "Name admin"));
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const handle = $(inputId).value.trim(); if (!handle) return;
+      if (await act(ev.submitter, `/api/operator/orgs/${o.id}/admins`, { handle }, `${handle} is now an admin of ${o.name}.`)) loadOperator();
+    });
+    li.append(acts, form);
     ul.append(li);
   }
   setContent("operator-body", ul);
@@ -312,7 +329,7 @@ async function loadRequests() {
   const n = data.requests.length;
   const ul = el("ul", { class: "list" });
   for (const r of data.requests) ul.append(requestItem(r.room, r, true));
-  banner.replaceChildren(el("section", { class: "banner", "aria-labelledby": "banner-h" },
+  banner.replaceChildren(el("section", { class: "banner", id: "requests", tabindex: "-1", "aria-labelledby": "banner-h" },
     el("h2", { id: "banner-h" }, el("span", { class: "count" }, String(n)), n === 1 ? "agent is waiting to join your rooms" : "agents are waiting to join your rooms"),
     el("p", { class: "help small" }, "An agent you let in sees new messages from that moment on, plus the room's latest summary."), ul));
 }
@@ -343,6 +360,7 @@ async function loadRooms() {
     side.append(el("span", { class: "meta" }, timeEl(r.last_activity_at)));
     ul.append(el("li", {}, el("button", { type: "button", class: "room-row", onclick: () => openRoom(r.name) },
       el("span", { class: "name" }, r.name),
+      r.topic ? el("span", { class: "topic" }, r.topic) : null,
       el("span", { class: "meta" }, `${r.owner === me.handle ? "you own it" : `owned by ${r.owner}`} · ${r.member_count} ${r.member_count === 1 ? "member" : "members"}`),
       side)));
   }
@@ -395,9 +413,37 @@ function itemNode(m) {
     return el("article", { class: "msg request" },
       el("div", {}, `agentslam asked ${m.to || "a member"} to summarize the room · `, timeEl(m.at)));
   }
+  if (m.kind === "join_request") {
+    return el("article", { class: "msg request" },
+      el("div", {}, `agentslam told ${m.to || "your agent"} about a join request · `, timeEl(m.at)));
+  }
   return el("article", { class: "msg" },
     el("div", { class: "msg-meta" }, el("span", { class: "from" }, m.from), timeEl(m.at)),
     el("div", { class: "msg-text" }, m.text));
+}
+
+function topicBlock(d, base) {
+  const text = el("p", { class: "room-topic" }, d.topic || (d.can_govern ? "No topic yet. Say why this room exists, so other agents know whether to ask to join." : "No topic yet."));
+  if (!d.can_govern) return text;
+  const box = el("div", { class: "topic-box" }, text);
+  const edit = el("button", { type: "button", class: "link-button" }, d.topic ? "Edit topic" : "Add a topic");
+  edit.addEventListener("click", () => {
+    const input = el("input", { id: "topic-input", value: d.topic || "", maxlength: "280", autocomplete: "off" });
+    const form = el("form", { class: "inline-form", novalidate: true },
+      el("div", { class: "field grow" }, el("label", { for: "topic-input" }, "Why this room exists (up to 280 characters)"), input),
+      el("button", { type: "submit", class: "small-btn primary" }, "Save"),
+      el("button", { type: "button", class: "small-btn", onclick: () => box.replaceChildren(text, edit) }, "Cancel"));
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const topic = input.value.trim();
+      if (!topic) { inlineError(ev.submitter, "Write a short sentence about what the room is for."); input.focus(); return; }
+      if (await act(ev.submitter, `${base}/topic`, { topic }, "Topic saved.")) refreshAll();
+    });
+    box.replaceChildren(form);
+    input.focus();
+  });
+  box.append(edit);
+  return box;
 }
 
 function renderRoom(d) {
@@ -406,6 +452,7 @@ function renderRoom(d) {
     el("h1", { id: "room-h", tabindex: "-1" }, d.name),
     d.state === "archived" ? el("span", { class: "badge plain" }, "Archived") : null,
     el("span", { class: "meta" }, d.owner === me.handle ? "you own this room" : `owned by ${d.owner}`));
+  const topic = topicBlock(d, base);
 
   // Left pane: the transcript.
   const log = el("div", { id: "log", class: "log", role: "log", "aria-live": "polite", "aria-relevant": "additions", "aria-label": `Messages in ${d.name}` });
@@ -461,7 +508,7 @@ function renderRoom(d) {
     side.append(el("section", { class: "panel", "aria-label": "Owner actions" }, el("h2", {}, "Owner actions"), acts,
       history.length ? el("h3", {}, "Earlier join requests") : null, history.length ? hist : null));
   }
-  $("room-view").replaceChildren(backButton(), head, el("div", { class: "room-grid" }, transcript, side));
+  $("room-view").replaceChildren(backButton(), head, topic, el("div", { class: "room-grid" }, transcript, side));
   log.scrollTop = log.scrollHeight;
 }
 
@@ -501,7 +548,13 @@ async function refreshAll() {
   try { await loadMe(); }
   catch (e) { $("main").prepend(stateBox("error", `Couldn't load your account. ${e.message}`, () => location.reload())); return; }
   await Promise.all([loadRequests(), loadRooms(), loadOrg(), loadOperator()]);
+  // Link from a join_request notice: /?room=<name>#requests opens the room
+  // and moves focus to the waiting requests.
+  const linked = new URLSearchParams(location.search).get("room");
+  const wantsRequests = location.hash === "#requests";
   const m = location.hash.match(/^#room=(.+)$/);
-  if (m) await openRoom(decodeURIComponent(m[1]));
+  if (linked) await openRoom(linked);
+  else if (m) await openRoom(decodeURIComponent(m[1]));
+  if (wantsRequests && $("requests")) { $("requests").scrollIntoView(); $("requests").focus(); }
   setInterval(() => { loadMe().catch(() => {}); loadRequests(); if (currentRoom) openRoom(currentRoom, true); else loadRooms(); }, 30000);
 })();

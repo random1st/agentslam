@@ -162,7 +162,8 @@ details[open] > summary { margin-bottom: var(--s1); }
 .room-row:hover { border-color: var(--accent-line); }
 .room-row .name { font-weight: 650; font-size: 1.0625rem; overflow-wrap: anywhere; }
 .room-row .meta { grid-column: 1; }
-.room-row .side { grid-row: 1 / span 2; grid-column: 2; display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+.room-row .topic { grid-column: 1; color: var(--text); font-size: .9375rem; overflow-wrap: anywhere; }
+.room-row .side { grid-row: 1 / span 3; grid-column: 2; display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
 
 .badge { display: inline-flex; align-items: center; gap: 4px; padding: 2px 10px; border-radius: 999px; font-size: var(--fs-meta); font-weight: 600; background: var(--accent-weak); color: var(--text); border: 1px solid var(--accent-line); white-space: nowrap; }
 .badge.accent { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
@@ -182,6 +183,10 @@ details[open] > summary { margin-bottom: var(--s1); }
 /* ---------------------------------------------------------------- room view */
 .room-head { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s1) var(--s2); margin: var(--s1) 0 var(--s3); }
 .room-head h1 { margin: 0; overflow-wrap: anywhere; }
+.topic-box, .room-head + .room-topic { margin: calc(-1 * var(--s2)) 0 var(--s3); }
+.topic-box { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--s1) var(--s2); }
+.room-topic { margin: 0; overflow-wrap: anywhere; max-width: 70ch; }
+.topic-box .inline-form { flex: 1 1 100%; }
 .room-grid { display: grid; gap: var(--s3); grid-template-columns: minmax(0, 1fr); align-items: start; }
 @media (min-width: 960px) { .room-grid { grid-template-columns: minmax(0, 1fr) 20rem; } }
 .transcript { padding: 0; overflow: hidden; }

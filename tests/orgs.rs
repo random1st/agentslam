@@ -70,9 +70,22 @@ async fn s5d_ac_uc_agentslam_orgs_org_isolation() {
     let ann = env.agent_in("ann", "codex", "a.com").await;
     let bob = env.agent_in("bob", "claude-pm", "b.com").await;
     // Room names are unique per organization: both can have "ios".
-    alice.ok("room_create", json!({"name": "ios"})).await;
-    bob.ok("room_create", json!({"name": "ios"})).await;
-    bob.ok("room_create", json!({"name": "secret-b"})).await;
+    alice
+        .ok(
+            "room_create",
+            json!({"name": "ios", "topic": "iOS release coordination"}),
+        )
+        .await;
+    bob.ok(
+        "room_create",
+        json!({"name": "ios", "topic": "iOS release coordination"}),
+    )
+    .await;
+    bob.ok(
+        "room_create",
+        json!({"name": "secret-b", "topic": "b.com internal planning"}),
+    )
+    .await;
     bob.ok("room_send", json!({"room": "ios", "text": "B-PRIVATE"}))
         .await;
     bob.ok(
@@ -327,7 +340,10 @@ async fn s5d_ac_uc_agentslam_orgs_org_oidc_claim() {
     b1.complete_org_create(cb).await;
     let token = b1.mint("claude-pm").await.0;
     Mcp::new(&env.base, &token)
-        .ok("room_create", json!({"name": "acme-room"}))
+        .ok(
+            "room_create",
+            json!({"name": "acme-room", "topic": "acme team room"}),
+        )
         .await;
 
     let (b2, cb2) = sign_in_as(
@@ -375,9 +391,18 @@ async fn s5d_ac_uc_agentslam_orgs_org_headless_token() {
     let a_person = env.person_in("alice", "a.com").await;
     let token = a_person.mint("hermes-ops").await.0;
     let a_agent = Mcp::new(&env.base, &token);
-    a_agent.ok("room_create", json!({"name": "alpha"})).await;
+    a_agent
+        .ok(
+            "room_create",
+            json!({"name": "alpha", "topic": "a.com alpha project"}),
+        )
+        .await;
     let bob = env.agent_in("bob", "claude-pm", "b.com").await;
-    bob.ok("room_create", json!({"name": "beta"})).await;
+    bob.ok(
+        "room_create",
+        json!({"name": "beta", "topic": "b.com beta project"}),
+    )
+    .await;
 
     let list = a_agent.ok("room_list", json!({})).await;
     let names: Vec<&str> = list["rooms"]
@@ -431,6 +456,193 @@ async fn s5d_ac_uc_agentslam_orgs_org_restrict() {
     )
     .await;
     assert_eq!(location(&b.complete_org_create(cb).await), "/");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn s5d_ac_uc_agentslam_orgs_org_oidc_fixed() {
+    let env = Env::start().await;
+    // No organization claim in either ID token.
+    let (b1, cb) = sign_in_as(
+        &env,
+        "oidc-fixed",
+        json!({"sub": "k-1", "email": "a@acme.test"}),
+    )
+    .await;
+    assert_eq!(location(&cb), "/org/create", "first person creates acme");
+    let page = b1.get("/org/create").await.text().await.expect("html");
+    assert!(page.contains("Create the organization for acme"), "{page}");
+    assert_eq!(location(&b1.complete_org_create(cb).await), "/");
+    let org = b1.get_json("/api/org").await;
+    assert_eq!(org["name"], json!("acme"));
+    assert_eq!(org["is_admin"], json!(true));
+
+    let (b2, cb2) = sign_in_as(
+        &env,
+        "oidc-fixed",
+        json!({"sub": "k-2", "email": "b@elsewhere.test"}),
+    )
+    .await;
+    assert_eq!(
+        location(&cb2),
+        "/",
+        "second person joins acme automatically"
+    );
+    let org2 = b2.get_json("/api/org").await;
+    assert_eq!(org2["name"], json!("acme"));
+    assert_eq!(org2["is_admin"], json!(false));
+    let key = format!("{}#acme", env.oidc_fixed.url);
+    let orgs: i64 = env
+        .server
+        .state
+        .db
+        .call(move |c| {
+            Ok(c.query_row(
+                "SELECT COUNT(*) FROM organizations WHERE key_kind = 'oidc' AND key_value = ?1",
+                [key],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .expect("db");
+    assert_eq!(orgs, 1, "keyed by (issuer, name)");
+    assert_eq!(count(&env, "SELECT COUNT(*) FROM organizations").await, 1);
+}
+
+/// The instance operator (super admin) of a.com, for operator tests.
+async fn env_with_operator() -> Env {
+    Env::start_with(|c| {
+        let iss = c.providers[0].issuer.clone().unwrap_or_default();
+        c.admins.push(AdminIdentity {
+            issuer: iss,
+            sub: "g-op-a.com".into(),
+        });
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn s5d_ac_uc_agentslam_orgs_operator_admins() {
+    let env = env_with_operator().await;
+    let alice_web = env.person_in("alice", "a.com").await; // creates a.com
+    let op = env.person_in("op", "a.com").await; // operator, member of a.com
+    let op_agent = env.agent_in("op", "claude-pm", "a.com").await;
+    let bob = env.agent_in("bob", "claude-pm", "b.com").await; // creates b.com
+    let bob_web = env.person_in("bob", "b.com").await;
+    let carol_web = env.person_in("carol", "b.com").await;
+    bob.ok(
+        "room_create",
+        json!({"name": "beta", "topic": "b.com beta project"}),
+    )
+    .await;
+    bob.ok("room_send", json!({"room": "beta", "text": "B-SECRET"}))
+        .await;
+    assert_eq!(
+        carol_web.get_json("/api/org").await["is_admin"],
+        json!(false)
+    );
+
+    let orgs = op.get_json("/api/operator/orgs").await;
+    let b_id = orgs["organizations"]
+        .as_array()
+        .and_then(|o| o.iter().find(|x| x["name"] == "b.com"))
+        .and_then(|x| x["id"].as_i64())
+        .expect("b.com listed");
+    let admins_path = format!("/api/operator/orgs/{b_id}/admins");
+    let disable_path = format!("/api/operator/orgs/{b_id}/disable");
+    let enable_path = format!("/api/operator/orgs/{b_id}/enable");
+
+    // A non-operator (even b.com's own admin) gets 403; so does a missing CSRF token.
+    for who in [&alice_web, &bob_web, &carol_web] {
+        assert_eq!(who.get("/api/operator/orgs").await.status(), 403);
+        assert_eq!(
+            who.post_api(&admins_path, Some(json!({"handle": "carol"})))
+                .await
+                .status(),
+            403
+        );
+        assert_eq!(who.post_api(&disable_path, None).await.status(), 403);
+        assert_eq!(who.post_api(&enable_path, None).await.status(), 403);
+    }
+    assert_eq!(
+        op.post_api_with(&admins_path, Some(json!({"handle": "carol"})), None)
+            .await
+            .status(),
+        403,
+        "CSRF"
+    );
+    assert_eq!(
+        carol_web.get_json("/api/org").await["is_admin"],
+        json!(false)
+    );
+
+    // Name carol (b.com) admin of b.com; a person of another org cannot be named.
+    assert_eq!(
+        op.post_api(&admins_path, Some(json!({"handle": "carol"})))
+            .await
+            .status(),
+        200
+    );
+    assert_eq!(
+        carol_web.get_json("/api/org").await["is_admin"],
+        json!(true)
+    );
+    assert_eq!(
+        op.post_api(&admins_path, Some(json!({"handle": "alice"})))
+            .await
+            .status(),
+        404,
+        "alice is not a person of b.com"
+    );
+    let orgs = op.get_json("/api/operator/orgs").await;
+    let b = orgs["organizations"]
+        .as_array()
+        .and_then(|o| o.iter().find(|x| x["name"] == "b.com"))
+        .cloned()
+        .expect("b.com");
+    assert_eq!(b["admins"], json!(["bob", "carol"]));
+
+    // Disable, then re-enable.
+    assert_eq!(op.post_api(&disable_path, None).await.status(), 200);
+    let (status, _) = bob
+        .rpc_raw("tools/call", json!({"name": "room_list", "arguments": {}}))
+        .await;
+    assert_eq!(status, 401, "disabled");
+    assert_eq!(bob_web.get("/api/me").await.status(), 401);
+    assert_eq!(op.post_api(&enable_path, None).await.status(), 200);
+    assert!(
+        bob.ok("room_list", json!({})).await["rooms"].is_array(),
+        "re-enabled"
+    );
+    assert_eq!(bob_web.get("/api/me").await.status(), 200);
+    assert_eq!(
+        op.post_api(&enable_path, None).await.status(),
+        404,
+        "already enabled"
+    );
+
+    // The operator still sees no b.com room or message.
+    let everything = [
+        op.get_json("/api/rooms").await.to_string(),
+        op.get_json("/api/requests").await.to_string(),
+        op.get_json("/api/operator/orgs").await.to_string(),
+        op_agent.call("room_list", json!({})).await.to_string(),
+    ]
+    .concat();
+    assert!(!everything.contains("beta") && !everything.contains("B-SECRET"));
+    assert_eq!(op.get("/api/rooms/beta").await.status(), 404);
+    assert_eq!(op.get("/api/rooms/beta/events").await.status(), 404);
+    assert_eq!(
+        op_agent
+            .err("room_read", json!({"room": "beta", "since": 0}))
+            .await,
+        "room_not_found"
+    );
+    assert_eq!(
+        op_agent
+            .err("room_request_join", json!({"room": "beta"}))
+            .await,
+        "room_not_found"
+    );
 }
 
 /// Not an acceptance criterion: an instance operator disables an organization;

@@ -61,7 +61,7 @@ fn every_acceptance_criterion_has_a_test() {
     let expected = expected_test_names(&spec);
     assert_eq!(
         expected.len(),
-        47,
+        52,
         "spec acceptance count changed: {expected:?}"
     );
     for p in PLANNED {
