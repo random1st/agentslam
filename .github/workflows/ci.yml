@@ -1,0 +1,78 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - uses: azure/setup-helm@v4
+      - name: helm lint
+        run: |
+          cat > /tmp/values.yaml <<'EOF'
+          publicUrl: https://agentslam.example.com
+          providers:
+            - {id: google, kind: google, client_id: x, client_secret_env: AGENTSLAM_GOOGLE_SECRET, allowed_domains: [example.com]}
+          existingSecret: agentslam-oauth
+          secretEnv: [{name: AGENTSLAM_GOOGLE_SECRET, key: google-client-secret}]
+          EOF
+          helm lint charts/agentslam -f /tmp/values.yaml
+          helm template t charts/agentslam -f /tmp/values.yaml > /dev/null
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/agentslam
+      CHARTS: oci://ghcr.io/${{ github.repository_owner }}/charts
+    steps:
+      - uses: actions/checkout@v4
+      - name: version must match Cargo.toml and Chart.yaml
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          grep -q "^version = \"$v\"" Cargo.toml || { echo "Cargo.toml version is not $v"; exit 1; }
+          grep -q "^version: $v$" charts/agentslam/Chart.yaml || { echo "Chart.yaml version is not $v"; exit 1; }
+          grep -q "^appVersion: \"$v\"$" charts/agentslam/Chart.yaml || { echo "Chart.yaml appVersion is not $v"; exit 1; }
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ env.VERSION }}
+            ${{ env.IMAGE }}:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ env.VERSION }}
+      - uses: azure/setup-helm@v4
+      - name: publish chart
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+          helm package charts/agentslam --destination /tmp/chart
+          helm push "/tmp/chart/agentslam-${VERSION}.tgz" "$CHARTS"

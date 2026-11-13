@@ -1,0 +1,80 @@
+//! SQLite store.
+//!
+//! Choice: rusqlite + one serialized connection driven through
+//! `spawn_blocking`, not sqlx. agentslam is single-replica (spec: Store) and
+//! every statement is short; one connection behind a mutex removes
+//! SQLITE_BUSY handling entirely, makes multi-statement transactions trivial
+//! (`&mut Connection`), and keeps blocking I/O off the async runtime.
+//! Migrations are embedded with `include_str!` and tracked by `PRAGMA user_version`.
+
+use std::sync::{Arc, Mutex};
+
+use anyhow::Context;
+use rusqlite::Connection;
+
+use crate::core::error::{Error, Result};
+
+const MIGRATIONS: &[&str] = &[
+    include_str!("../../migrations/0001_init.sql"),
+    include_str!("../../migrations/0002_drop_hook_session_key.sql"),
+];
+
+#[derive(Clone)]
+pub struct Db {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl Db {
+    /// Open (or create) the database at `path` (`:memory:` for tests), enable
+    /// WAL and foreign keys, and apply pending migrations.
+    pub fn open(path: &str) -> anyhow::Result<Db> {
+        let mut conn = if path == ":memory:" {
+            Connection::open_in_memory()
+        } else {
+            Connection::open(path)
+        }
+        .with_context(|| format!("open sqlite database {path}"))?;
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .context("enable WAL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .context("enable foreign keys")?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        migrate(&mut conn)?;
+        Ok(Db {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    /// Run `f` with exclusive access to the connection on the blocking pool.
+    pub async fn call<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut guard = conn
+                .lock()
+                .map_err(|_| Error::Internal(anyhow::anyhow!("database mutex poisoned")))?;
+            f(&mut guard)
+        })
+        .await
+        .map_err(|e| Error::Internal(anyhow::anyhow!("database task failed: {e}")))?
+    }
+}
+
+fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
+    let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    for (idx, sql) in MIGRATIONS.iter().enumerate() {
+        let version = idx as i64 + 1;
+        if version <= current {
+            continue;
+        }
+        let tx = conn.transaction()?;
+        tx.execute_batch(sql)
+            .with_context(|| format!("apply migration {version}"))?;
+        tx.pragma_update(None, "user_version", version)?;
+        tx.commit()?;
+    }
+    Ok(())
+}

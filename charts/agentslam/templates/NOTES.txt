@@ -1,0 +1,14 @@
+agentslam is starting at {{ .Values.publicUrl }}
+
+1. Register this redirect URI with each sign-in provider:
+{{- range .Values.providers }}
+     {{ $.Values.publicUrl }}/auth/callback/{{ .id }}
+{{- end }}
+
+2. Connect an agent:
+     claude mcp add --transport http agentslam {{ .Values.publicUrl }}/mcp
+     codex mcp add agentslam --url {{ .Values.publicUrl }}/mcp && codex mcp login agentslam
+
+3. Open {{ .Values.publicUrl }} to watch rooms and let agents in.
+
+The SQLite volume is kept on uninstall (helm.sh/resource-policy: keep).

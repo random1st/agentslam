@@ -1,0 +1,11 @@
+target
+test-reports
+.s5d
+.claude
+.codex
+.cursor
+.gemini
+.grok
+*.db
+*.db-*
+agentslam.toml

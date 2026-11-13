@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "agentslam.fullname" . }}
+  labels:
+    {{- include "agentslam.labels" . | nindent 4 }}
+data:
+  agentslam.toml: |
+    {{- include "agentslam.config" . | nindent 4 }}

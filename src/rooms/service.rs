@@ -1,0 +1,1013 @@
+//! Rooms domain: rooms, admission, messages, session room sets, wait.
+//! Transport-independent: MCP tools, web routes and hook endpoints call these.
+//!
+//! Content rule (inv.agentslam.member-only-content): every read path clamps to
+//! `seq > admission_seq` of the caller's *current* membership.
+
+use std::collections::HashMap;
+use std::time::Duration;
+
+use rusqlite::{Connection, OptionalExtension, params};
+use serde::Serialize;
+use tokio::sync::broadcast::error::RecvError;
+
+use crate::core::config::valid_slug;
+use crate::core::{Error, Result, Shared};
+use crate::identity::Caller;
+use crate::identity::people::PRESENCE_WINDOW_S;
+use crate::identity::tokens::caller_for_hash;
+use crate::rooms::notify::Event;
+
+pub const MAX_TEXT_CHARS: usize = 16_000;
+pub const READ_LIMIT: i64 = 200;
+pub const MAX_WAIT_S: u64 = 50;
+pub const REQUEST_EXPIRY_S: i64 = 7 * 86_400;
+pub const MAX_SESSION_LEN: usize = 128;
+
+/// Validate an agentslam session id (B7): 1..128 chars of `[A-Za-z0-9._:-]`.
+/// The session is an explicit tool argument; the agent always comes from the token.
+pub fn validate_session(s: &str) -> Result<String> {
+    let ok = (1..=MAX_SESSION_LEN).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'));
+    if ok {
+        Ok(s.to_string())
+    } else {
+        Err(Error::InvalidSession)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Room {
+    pub id: i64,
+    pub name: String,
+    pub owner_person_id: i64,
+    pub state: String,
+    pub last_seq: i64,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq)]
+pub struct Message {
+    pub room: String,
+    pub seq: i64,
+    pub from: String,
+    pub text: String,
+    pub at: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RoomListEntry {
+    pub name: String,
+    pub owner: String,
+    pub state: String,
+    pub member_count: i64,
+    /// member | pending | none
+    pub status: String,
+    /// Outcome of the caller's latest join request, if any
+    /// (pending | confirmed | rejected | expired).
+    pub last_request: Option<String>,
+    /// Whether the room is in the given session's attached set (false without a session).
+    pub attached: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WaitResult {
+    pub rooms_attached: bool,
+    pub timed_out: bool,
+    pub messages: Vec<Message>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+// ---------------------------------------------------------------- helpers
+
+fn row_room(r: &rusqlite::Row<'_>) -> rusqlite::Result<Room> {
+    Ok(Room {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        owner_person_id: r.get(2)?,
+        state: r.get(3)?,
+        last_seq: r.get(4)?,
+    })
+}
+
+pub fn room_by_name(conn: &Connection, name: &str) -> Result<Option<Room>> {
+    Ok(conn
+        .query_row(
+            "SELECT id, name, owner_person_id, state, last_seq FROM rooms WHERE name = ?1 AND state <> 'deleted'",
+            [name],
+            row_room,
+        )
+        .optional()?)
+}
+
+fn room_by_id(conn: &Connection, id: i64) -> Result<Option<Room>> {
+    Ok(conn
+        .query_row(
+            "SELECT id, name, owner_person_id, state, last_seq FROM rooms WHERE id = ?1 AND state <> 'deleted'",
+            [id],
+            row_room,
+        )
+        .optional()?)
+}
+
+fn require_room(conn: &Connection, name: &str) -> Result<Room> {
+    room_by_name(conn, name)?.ok_or(Error::RoomNotFound)
+}
+
+/// Current admission_seq if the agent is a member.
+fn member_admission(conn: &Connection, room_id: i64, agent_id: i64) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT admission_seq FROM memberships WHERE room_id = ?1 AND agent_id = ?2 AND status = 'member'",
+            params![room_id, agent_id],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+fn require_member(conn: &Connection, name: &str, agent_id: i64) -> Result<(Room, i64)> {
+    let room = require_room(conn, name)?;
+    let adm = member_admission(conn, room.id, agent_id)?.ok_or(Error::NotAMember)?;
+    Ok((room, adm))
+}
+
+/// Lazily mark pending requests older than 7 days as expired.
+pub fn expire_requests(conn: &Connection, now: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE join_requests SET status = 'expired', decided_at = ?1
+         WHERE status = 'pending' AND created_at <= ?2",
+        params![now, now - REQUEST_EXPIRY_S],
+    )?;
+    Ok(())
+}
+
+fn messages_after(conn: &Connection, room: &Room, after: i64, limit: i64) -> Result<Vec<Message>> {
+    let mut stmt = conn.prepare(
+        "SELECT m.seq, p.handle || '/' || a.label, m.text, m.created_at
+         FROM messages m JOIN agents a ON a.id = m.agent_id JOIN persons p ON p.id = a.person_id
+         WHERE m.room_id = ?1 AND m.seq > ?2 ORDER BY m.seq ASC LIMIT ?3",
+    )?;
+    let rows = stmt
+        .query_map(params![room.id, after, limit], |r| {
+            Ok(Message {
+                room: room.name.clone(),
+                seq: r.get(0)?,
+                from: r.get(1)?,
+                text: r.get(2)?,
+                at: r.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
+fn advance_cursor(
+    conn: &Connection,
+    agent_id: i64,
+    session_key: &str,
+    room_id: i64,
+    seq: i64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE session_rooms SET cursor = MAX(cursor, ?4)
+         WHERE agent_id = ?1 AND session_key = ?2 AND room_id = ?3",
+        params![agent_id, session_key, room_id, seq],
+    )?;
+    Ok(())
+}
+
+fn publish_all(state: &Shared, events: Vec<Event>) {
+    for e in events {
+        state.hub.publish(e);
+    }
+}
+
+// ---------------------------------------------------------------- agent operations
+
+pub async fn create(state: &Shared, caller: &Caller, name: String) -> Result<RoomListEntry> {
+    if !valid_slug(&name, 2, 40) {
+        return Err(Error::InvalidName);
+    }
+    let now = state.clock.now();
+    let c = caller.clone();
+    let (room_id, entry) = state
+        .db
+        .call(move |conn| {
+            let tx = conn.transaction()?;
+            if room_by_name(&tx, &name)?.is_some() {
+                return Err(Error::RoomExists);
+            }
+            tx.execute(
+                "INSERT INTO rooms (name, owner_person_id, state, last_seq, created_at) VALUES (?1, ?2, 'active', 0, ?3)",
+                params![name, c.person_id, now],
+            )?;
+            let room_id = tx.last_insert_rowid();
+            tx.execute(
+                "INSERT INTO memberships (room_id, agent_id, status, admission_seq, updated_at) VALUES (?1, ?2, 'member', 0, ?3)",
+                params![room_id, c.agent_id, now],
+            )?;
+            tx.commit()?;
+            Ok((
+                room_id,
+                RoomListEntry {
+                    name,
+                    owner: c.handle.clone(),
+                    state: "active".into(),
+                    member_count: 1,
+                    status: "member".into(),
+                    last_request: None,
+                    attached: false,
+                },
+            ))
+        })
+        .await?;
+    state.hub.publish(Event::RoomChanged { room_id });
+    Ok(entry)
+}
+
+pub async fn list(
+    state: &Shared,
+    caller: &Caller,
+    session: Option<String>,
+) -> Result<Vec<RoomListEntry>> {
+    let now = state.clock.now();
+    let agent_id = caller.agent_id;
+    state
+        .db
+        .call(move |conn| {
+            expire_requests(conn, now)?;
+            let mut stmt = conn.prepare(
+                "SELECT r.name, p.handle, r.state,
+                   (SELECT COUNT(*) FROM memberships m WHERE m.room_id = r.id AND m.status = 'member'),
+                   (SELECT status FROM memberships m WHERE m.room_id = r.id AND m.agent_id = ?1),
+                   (SELECT status FROM join_requests j WHERE j.room_id = r.id AND j.agent_id = ?1 ORDER BY j.id DESC LIMIT 1),
+                   (?2 IS NOT NULL AND EXISTS(SELECT 1 FROM session_rooms s WHERE s.room_id = r.id AND s.agent_id = ?1 AND s.session_key = ?2))
+                 FROM rooms r JOIN persons p ON p.id = r.owner_person_id
+                 WHERE r.state <> 'deleted' ORDER BY r.name",
+            )?;
+            let rows = stmt
+                .query_map(params![agent_id, session], |r| {
+                    let membership: Option<String> = r.get(4)?;
+                    let last_request: Option<String> = r.get(5)?;
+                    let status = if membership.as_deref() == Some("member") {
+                        "member"
+                    } else if last_request.as_deref() == Some("pending") {
+                        "pending"
+                    } else {
+                        "none"
+                    };
+                    Ok(RoomListEntry {
+                        name: r.get(0)?,
+                        owner: r.get(1)?,
+                        state: r.get(2)?,
+                        member_count: r.get(3)?,
+                        status: status.to_string(),
+                        last_request,
+                        attached: r.get(6)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            Ok(rows)
+        })
+        .await
+}
+
+#[derive(Debug, Serialize)]
+pub struct JoinOutcome {
+    pub room: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<i64>,
+}
+
+pub async fn request_join(state: &Shared, caller: &Caller, room: String) -> Result<JoinOutcome> {
+    let now = state.clock.now();
+    let agent_id = caller.agent_id;
+    let (room_id, out) = state
+        .db
+        .call(move |conn| {
+            let tx = conn.transaction()?;
+            expire_requests(&tx, now)?;
+            let r = require_room(&tx, &room)?;
+            if r.state == "archived" {
+                return Err(Error::RoomArchived);
+            }
+            if member_admission(&tx, r.id, agent_id)?.is_some() {
+                return Ok((r.id, JoinOutcome { room, status: "member".into(), request_id: None }));
+            }
+            let pending: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM join_requests WHERE room_id = ?1 AND agent_id = ?2 AND status = 'pending'",
+                    params![r.id, agent_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let id = match pending {
+                Some(id) => id,
+                None => {
+                    tx.execute(
+                        "INSERT INTO join_requests (room_id, agent_id, status, created_at) VALUES (?1, ?2, 'pending', ?3)",
+                        params![r.id, agent_id, now],
+                    )?;
+                    tx.last_insert_rowid()
+                }
+            };
+            tx.commit()?;
+            Ok((r.id, JoinOutcome { room, status: "pending".into(), request_id: Some(id) }))
+        })
+        .await?;
+    state.hub.publish(Event::RoomChanged { room_id });
+    Ok(out)
+}
+
+pub async fn leave(state: &Shared, caller: &Caller, room: String) -> Result<serde_json::Value> {
+    let now = state.clock.now();
+    let agent_id = caller.agent_id;
+    let room_id = state
+        .db
+        .call(move |conn| {
+            let (r, _) = require_member(conn, &room, agent_id)?;
+            conn.execute(
+                "UPDATE memberships SET status = 'left', updated_at = ?3 WHERE room_id = ?1 AND agent_id = ?2",
+                params![r.id, agent_id, now],
+            )?;
+            conn.execute(
+                "DELETE FROM session_rooms WHERE agent_id = ?1 AND room_id = ?2",
+                params![agent_id, r.id],
+            )?;
+            Ok(r.id)
+        })
+        .await?;
+    publish_all(
+        state,
+        vec![
+            Event::AccessChanged {
+                agent_id,
+                room_id: Some(room_id),
+            },
+            Event::RoomChanged { room_id },
+        ],
+    );
+    Ok(serde_json::json!({"status": "left"}))
+}
+
+pub async fn attach(
+    state: &Shared,
+    caller: &Caller,
+    session_key: String,
+    room: String,
+) -> Result<serde_json::Value> {
+    let agent_id = caller.agent_id;
+    state
+        .db
+        .call(move |conn| {
+            let (r, adm) = require_member(conn, &room, agent_id)?;
+            // A fresh attachment starts at the current end: unread = new messages.
+            conn.execute(
+                "INSERT INTO session_rooms (agent_id, session_key, room_id, cursor) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (agent_id, session_key, room_id) DO NOTHING",
+                params![agent_id, session_key, r.id, r.last_seq.max(adm)],
+            )?;
+            let cursor: i64 = conn.query_row(
+                "SELECT cursor FROM session_rooms WHERE agent_id = ?1 AND session_key = ?2 AND room_id = ?3",
+                params![agent_id, session_key, r.id],
+                |row| row.get(0),
+            )?;
+            Ok(serde_json::json!({"room": r.name, "attached": true, "cursor": cursor}))
+        })
+        .await
+}
+
+pub async fn detach(
+    state: &Shared,
+    caller: &Caller,
+    session_key: String,
+    room: String,
+) -> Result<serde_json::Value> {
+    let agent_id = caller.agent_id;
+    state
+        .db
+        .call(move |conn| {
+            let r = require_room(conn, &room)?;
+            conn.execute(
+                "DELETE FROM session_rooms WHERE agent_id = ?1 AND session_key = ?2 AND room_id = ?3",
+                params![agent_id, session_key, r.id],
+            )?;
+            Ok(serde_json::json!({"room": r.name, "attached": false}))
+        })
+        .await
+}
+
+pub async fn send(state: &Shared, caller: &Caller, room: String, text: String) -> Result<Message> {
+    let now = state.clock.now();
+    let c = caller.clone();
+    let (room_id, msg) = state
+        .db
+        .call(move |conn| {
+            let tx = conn.transaction()?;
+            let (r, _) = require_member(&tx, &room, c.agent_id)?;
+            if r.state == "archived" {
+                return Err(Error::RoomArchived);
+            }
+            let n = text.chars().count();
+            if n == 0 || n > MAX_TEXT_CHARS {
+                return Err(Error::InvalidText);
+            }
+            let seq = r.last_seq + 1;
+            tx.execute("UPDATE rooms SET last_seq = ?2 WHERE id = ?1", params![r.id, seq])?;
+            tx.execute(
+                "INSERT INTO messages (room_id, seq, agent_id, text, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![r.id, seq, c.agent_id, text, now],
+            )?;
+            tx.commit()?;
+            Ok((r.id, Message { room: r.name, seq, from: c.display(), text, at: now }))
+        })
+        .await?;
+    state.hub.publish(Event::Message {
+        room_id,
+        seq: msg.seq,
+    });
+    Ok(msg)
+}
+
+/// `room_read` has no session argument (contract), so it never moves session cursors.
+pub async fn read(
+    state: &Shared,
+    caller: &Caller,
+    room: String,
+    since: i64,
+) -> Result<Vec<Message>> {
+    let agent_id = caller.agent_id;
+    state
+        .db
+        .call(move |conn| {
+            let (r, adm) = require_member(conn, &room, agent_id)?;
+            messages_after(conn, &r, since.max(adm).max(0), READ_LIMIT)
+        })
+        .await
+}
+
+struct Target {
+    room_id: i64,
+    name: String,
+    attached: bool,
+    cursor: i64,
+}
+
+enum Check {
+    Ready(Vec<Message>),
+    Nothing,
+}
+
+pub async fn wait(
+    state: &Shared,
+    caller: &Caller,
+    session_key: String,
+    rooms: Option<Vec<String>>,
+    timeout_s: u64,
+) -> Result<WaitResult> {
+    let timeout = Duration::from_secs(timeout_s.clamp(1, MAX_WAIT_S));
+    // Subscribe before the first check so no event between check and wait is lost.
+    let mut rx = state.hub.subscribe();
+    let agent_id = caller.agent_id;
+    let sk = session_key.clone();
+    let mut targets: Vec<Target> = state
+        .db
+        .call(move |conn| {
+            let attached: HashMap<i64, i64> = {
+                let mut stmt = conn.prepare(
+                    "SELECT room_id, cursor FROM session_rooms WHERE agent_id = ?1 AND session_key = ?2",
+                )?;
+                stmt.query_map(params![agent_id, sk], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<rusqlite::Result<_>>()?
+            };
+            let mut out = Vec::new();
+            match rooms.filter(|r| !r.is_empty()) {
+                Some(names) => {
+                    for name in names {
+                        let (r, _) = require_member(conn, &name, agent_id)?;
+                        let (is_att, cursor) = match attached.get(&r.id) {
+                            Some(c) => (true, *c),
+                            None => (false, r.last_seq),
+                        };
+                        out.push(Target { room_id: r.id, name: r.name, attached: is_att, cursor });
+                    }
+                }
+                None => {
+                    for (room_id, cursor) in attached {
+                        if let Some(r) = room_by_id(conn, room_id)? {
+                            out.push(Target { room_id, name: r.name, attached: true, cursor });
+                        }
+                    }
+                }
+            }
+            Ok(out)
+        })
+        .await?;
+    if targets.is_empty() {
+        return Ok(WaitResult {
+            rooms_attached: false,
+            timed_out: false,
+            messages: vec![],
+            note: Some("no rooms attached to this session; call room_attach or pass rooms".into()),
+        });
+    }
+    targets.sort_by_key(|t| t.room_id);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let resource = state.config.mcp_resource();
+    loop {
+        let token_hash = caller.token_hash.clone();
+        let res = resource.clone();
+        let now = state.clock.now();
+        let sk = session_key.clone();
+        let snapshot: Vec<(i64, String, bool, i64)> = targets
+            .iter()
+            .map(|t| (t.room_id, t.name.clone(), t.attached, t.cursor))
+            .collect();
+        let check = state
+            .db
+            .call(move |conn| {
+                if caller_for_hash(conn, &token_hash, &res, now)?.is_none() {
+                    return Err(Error::Unauthorized);
+                }
+                let mut all = Vec::new();
+                for (room_id, name, attached, cursor) in &snapshot {
+                    let r = room_by_id(conn, *room_id)?.ok_or(Error::RoomNotFound)?;
+                    let _ = name;
+                    let adm =
+                        member_admission(conn, *room_id, agent_id)?.ok_or(Error::NotAMember)?;
+                    let msgs = messages_after(conn, &r, (*cursor).max(adm), READ_LIMIT)?;
+                    if let (true, Some(last)) = (*attached, msgs.last()) {
+                        advance_cursor(conn, agent_id, &sk, *room_id, last.seq)?;
+                    }
+                    all.extend(msgs);
+                }
+                if all.is_empty() {
+                    Ok(Check::Nothing)
+                } else {
+                    Ok(Check::Ready(all))
+                }
+            })
+            .await?;
+        if let Check::Ready(messages) = check {
+            return Ok(WaitResult {
+                rooms_attached: true,
+                timed_out: false,
+                messages,
+                note: None,
+            });
+        }
+        // Wait for a relevant event or the deadline.
+        loop {
+            tokio::select! {
+                ev = rx.recv() => match ev {
+                    Ok(e) => {
+                        let relevant = match &e {
+                            Event::AccessChanged { agent_id: a, .. } => *a == agent_id,
+                            other => other.room_id().is_some_and(|id| targets.iter().any(|t| t.room_id == id)),
+                        };
+                        if relevant { break; }
+                    }
+                    Err(RecvError::Lagged(_)) => break,
+                    Err(RecvError::Closed) => {
+                        return Ok(WaitResult { rooms_attached: true, timed_out: true, messages: vec![], note: None });
+                    }
+                },
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Ok(WaitResult { rooms_attached: true, timed_out: true, messages: vec![], note: None });
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- hook support
+
+/// Unread messages of the session's attached rooms; `advance` moves cursors.
+pub async fn unread(
+    state: &Shared,
+    caller: &Caller,
+    session_key: String,
+    advance: bool,
+) -> Result<Vec<Message>> {
+    let agent_id = caller.agent_id;
+    state
+        .db
+        .call(move |conn| {
+            let attached: Vec<(i64, i64)> = {
+                let mut stmt = conn.prepare(
+                    "SELECT room_id, cursor FROM session_rooms WHERE agent_id = ?1 AND session_key = ?2 ORDER BY room_id",
+                )?;
+                stmt.query_map(params![agent_id, session_key], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<rusqlite::Result<_>>()?
+            };
+            let mut all = Vec::new();
+            for (room_id, cursor) in attached {
+                let Some(r) = room_by_id(conn, room_id)? else { continue };
+                let Some(adm) = member_admission(conn, room_id, agent_id)? else { continue };
+                let msgs = messages_after(conn, &r, cursor.max(adm), READ_LIMIT)?;
+                if advance && let Some(last) = msgs.last() {
+                    advance_cursor(conn, agent_id, &session_key, room_id, last.seq)?;
+                }
+                all.extend(msgs);
+            }
+            Ok(all)
+        })
+        .await
+}
+
+// ---------------------------------------------------------------- owner (web) operations
+
+/// The person acting in the web UI.
+#[derive(Debug, Clone, Copy)]
+pub struct Person {
+    pub person_id: i64,
+    pub is_admin: bool,
+}
+
+fn require_governor(conn: &Connection, who: Person, room: &str) -> Result<Room> {
+    let r = require_room(conn, room)?;
+    if r.owner_person_id == who.person_id || who.is_admin {
+        Ok(r)
+    } else {
+        Err(Error::Forbidden(
+            "only the room owner or an admin can do this".into(),
+        ))
+    }
+}
+
+pub async fn confirm_request(
+    state: &Shared,
+    who: Person,
+    room: String,
+    request_id: i64,
+) -> Result<()> {
+    let now = state.clock.now();
+    let (room_id, agent_id) = state
+        .db
+        .call(move |conn| {
+            let tx = conn.transaction()?;
+            expire_requests(&tx, now)?;
+            let r = require_governor(&tx, who, &room)?;
+            if r.state == "archived" {
+                return Err(Error::RoomArchived);
+            }
+            let req: Option<(i64, String)> = tx
+                .query_row(
+                    "SELECT agent_id, status FROM join_requests WHERE id = ?1 AND room_id = ?2",
+                    params![request_id, r.id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let (agent_id, status) = req.ok_or(Error::NotFound)?;
+            if status != "pending" {
+                return Err(Error::Conflict(format!("request is {status}")));
+            }
+            tx.execute(
+                "UPDATE join_requests SET status = 'confirmed', decided_at = ?2, decided_by = ?3 WHERE id = ?1",
+                params![request_id, now, who.person_id],
+            )?;
+            tx.execute(
+                "INSERT INTO memberships (room_id, agent_id, status, admission_seq, updated_at) VALUES (?1, ?2, 'member', ?3, ?4)
+                 ON CONFLICT (room_id, agent_id) DO UPDATE SET status = 'member', admission_seq = excluded.admission_seq, updated_at = excluded.updated_at",
+                params![r.id, agent_id, r.last_seq, now],
+            )?;
+            tx.commit()?;
+            Ok((r.id, agent_id))
+        })
+        .await?;
+    publish_all(
+        state,
+        vec![
+            Event::RoomChanged { room_id },
+            Event::AccessChanged {
+                agent_id,
+                room_id: Some(room_id),
+            },
+        ],
+    );
+    Ok(())
+}
+
+pub async fn reject_request(
+    state: &Shared,
+    who: Person,
+    room: String,
+    request_id: i64,
+) -> Result<()> {
+    let now = state.clock.now();
+    let room_id = state
+        .db
+        .call(move |conn| {
+            expire_requests(conn, now)?;
+            let r = require_governor(conn, who, &room)?;
+            let n = conn.execute(
+                "UPDATE join_requests SET status = 'rejected', decided_at = ?3, decided_by = ?4
+                 WHERE id = ?1 AND room_id = ?2 AND status = 'pending'",
+                params![request_id, r.id, now, who.person_id],
+            )?;
+            if n == 0 {
+                return Err(Error::Conflict("request is not pending".into()));
+            }
+            Ok(r.id)
+        })
+        .await?;
+    state.hub.publish(Event::RoomChanged { room_id });
+    Ok(())
+}
+
+pub async fn remove_member(state: &Shared, who: Person, room: String, agent_id: i64) -> Result<()> {
+    let now = state.clock.now();
+    let room_id = state
+        .db
+        .call(move |conn| {
+            let r = require_governor(conn, who, &room)?;
+            let n = conn.execute(
+                "UPDATE memberships SET status = 'removed', updated_at = ?3 WHERE room_id = ?1 AND agent_id = ?2 AND status = 'member'",
+                params![r.id, agent_id, now],
+            )?;
+            if n == 0 {
+                return Err(Error::NotFound);
+            }
+            conn.execute(
+                "DELETE FROM session_rooms WHERE agent_id = ?1 AND room_id = ?2",
+                params![agent_id, r.id],
+            )?;
+            Ok(r.id)
+        })
+        .await?;
+    // B9: open waits and streams of that agent end at once.
+    publish_all(
+        state,
+        vec![
+            Event::AccessChanged {
+                agent_id,
+                room_id: Some(room_id),
+            },
+            Event::RoomChanged { room_id },
+        ],
+    );
+    Ok(())
+}
+
+pub async fn set_state(
+    state: &Shared,
+    who: Person,
+    room: String,
+    target: &'static str,
+) -> Result<()> {
+    let room_id = state
+        .db
+        .call(move |conn| {
+            let tx = conn.transaction()?;
+            let r = require_governor(&tx, who, &room)?;
+            match target {
+                "archived" | "active" => {
+                    tx.execute(
+                        "UPDATE rooms SET state = ?2 WHERE id = ?1",
+                        params![r.id, target],
+                    )?;
+                }
+                "deleted" => {
+                    // Transcript purged; the name becomes free again.
+                    tx.execute("DELETE FROM messages WHERE room_id = ?1", [r.id])?;
+                    tx.execute("DELETE FROM session_rooms WHERE room_id = ?1", [r.id])?;
+                    tx.execute("DELETE FROM memberships WHERE room_id = ?1", [r.id])?;
+                    tx.execute("DELETE FROM join_requests WHERE room_id = ?1", [r.id])?;
+                    tx.execute("UPDATE rooms SET state = 'deleted' WHERE id = ?1", [r.id])?;
+                }
+                _ => return Err(Error::BadRequest("unknown state".into())),
+            }
+            tx.commit()?;
+            Ok(r.id)
+        })
+        .await?;
+    state.hub.publish(Event::RoomChanged { room_id });
+    Ok(())
+}
+
+// ---------------------------------------------------------------- web views
+
+/// Lowest seq floor the person may see in the room: owner/admin see the full
+/// transcript; otherwise the min admission_seq of the person's member agents.
+/// None = no access (inv.agentslam.member-only-content).
+fn web_floor(conn: &Connection, who: Person, r: &Room) -> Result<Option<i64>> {
+    if r.owner_person_id == who.person_id || who.is_admin {
+        return Ok(Some(0));
+    }
+    Ok(conn.query_row(
+        "SELECT MIN(m.admission_seq) FROM memberships m JOIN agents a ON a.id = m.agent_id
+         WHERE m.room_id = ?1 AND a.person_id = ?2 AND m.status = 'member'",
+        params![r.id, who.person_id],
+        |row| row.get(0),
+    )?)
+}
+
+#[derive(Debug, Serialize)]
+pub struct RoomSummary {
+    pub name: String,
+    pub owner: String,
+    pub state: String,
+    pub member_count: i64,
+    pub pending_requests: i64,
+    pub can_govern: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PendingRequestView {
+    pub room: String,
+    pub id: i64,
+    pub agent: String,
+    pub created_at: i64,
+    /// Outcome of this agent's previous request in the room, if any.
+    pub previous: Option<String>,
+}
+
+/// Pending (non-expired) join requests in rooms the person owns (admin: all), oldest first.
+pub async fn pending_requests(state: &Shared, who: Person) -> Result<Vec<PendingRequestView>> {
+    let now = state.clock.now();
+    state
+        .db
+        .call(move |conn| {
+            expire_requests(conn, now)?;
+            let mut stmt = conn.prepare(
+                "SELECT r.name, j.id, p.handle || '/' || a.label, j.created_at,
+                   (SELECT j2.status FROM join_requests j2 WHERE j2.room_id = j.room_id AND j2.agent_id = j.agent_id AND j2.id < j.id ORDER BY j2.id DESC LIMIT 1)
+                 FROM join_requests j JOIN rooms r ON r.id = j.room_id
+                 JOIN agents a ON a.id = j.agent_id JOIN persons p ON p.id = a.person_id
+                 WHERE j.status = 'pending' AND r.state = 'active' AND (?2 OR r.owner_person_id = ?1)
+                 ORDER BY j.created_at, j.id",
+            )?;
+            let rows = stmt
+                .query_map(params![who.person_id, who.is_admin], |r| {
+                    Ok(PendingRequestView {
+                        room: r.get(0)?,
+                        id: r.get(1)?,
+                        agent: r.get(2)?,
+                        created_at: r.get(3)?,
+                        previous: r.get(4)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            Ok(rows)
+        })
+        .await
+}
+
+pub async fn visible_rooms(state: &Shared, who: Person) -> Result<Vec<RoomSummary>> {
+    let now = state.clock.now();
+    state
+        .db
+        .call(move |conn| {
+            expire_requests(conn, now)?;
+            let mut stmt = conn.prepare(
+                "SELECT r.name, p.handle, r.state, r.owner_person_id,
+                   (SELECT COUNT(*) FROM memberships m WHERE m.room_id = r.id AND m.status = 'member'),
+                   (SELECT COUNT(*) FROM join_requests j WHERE j.room_id = r.id AND j.status = 'pending')
+                 FROM rooms r JOIN persons p ON p.id = r.owner_person_id
+                 WHERE r.state <> 'deleted' AND (?2 OR r.owner_person_id = ?1 OR EXISTS (
+                   SELECT 1 FROM memberships m JOIN agents a ON a.id = m.agent_id
+                   WHERE m.room_id = r.id AND a.person_id = ?1 AND m.status = 'member'))
+                 ORDER BY r.name",
+            )?;
+            let rows = stmt
+                .query_map(params![who.person_id, who.is_admin], |r| {
+                    let owner_id: i64 = r.get(3)?;
+                    Ok(RoomSummary {
+                        name: r.get(0)?,
+                        owner: r.get(1)?,
+                        state: r.get(2)?,
+                        member_count: r.get(4)?,
+                        pending_requests: r.get(5)?,
+                        can_govern: owner_id == who.person_id || who.is_admin,
+                    })
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            Ok(rows)
+        })
+        .await
+}
+
+#[derive(Debug, Serialize)]
+pub struct MemberView {
+    pub agent_id: i64,
+    pub agent: String,
+    pub presence: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RequestView {
+    pub id: i64,
+    pub agent: String,
+    pub status: String,
+    pub created_at: i64,
+    /// Outcome of this agent's previous request in the room, if any.
+    pub previous: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RoomDetail {
+    pub name: String,
+    pub owner: String,
+    pub state: String,
+    pub can_govern: bool,
+    pub last_seq: i64,
+    pub members: Vec<MemberView>,
+    pub requests: Vec<RequestView>,
+    pub messages: Vec<Message>,
+}
+
+/// Access check for web views and SSE: returns (room id, visibility floor).
+pub async fn web_access(state: &Shared, who: Person, room: String) -> Result<(i64, i64)> {
+    state
+        .db
+        .call(move |conn| {
+            let r = require_room(conn, &room)?;
+            let floor = web_floor(conn, who, &r)?.ok_or(Error::NotAMember)?;
+            Ok((r.id, floor))
+        })
+        .await
+}
+
+pub async fn web_messages_after(
+    state: &Shared,
+    who: Person,
+    room: String,
+    after: i64,
+) -> Result<Vec<Message>> {
+    state
+        .db
+        .call(move |conn| {
+            let r = require_room(conn, &room)?;
+            let floor = web_floor(conn, who, &r)?.ok_or(Error::NotAMember)?;
+            messages_after(conn, &r, after.max(floor), READ_LIMIT)
+        })
+        .await
+}
+
+pub async fn room_detail(state: &Shared, who: Person, room: String) -> Result<RoomDetail> {
+    let now = state.clock.now();
+    state
+        .db
+        .call(move |conn| {
+            expire_requests(conn, now)?;
+            let r = require_room(conn, &room)?;
+            let floor = web_floor(conn, who, &r)?.ok_or(Error::NotAMember)?;
+            let owner: String = conn.query_row(
+                "SELECT handle FROM persons WHERE id = ?1",
+                [r.owner_person_id],
+                |row| row.get(0),
+            )?;
+            let mut stmt = conn.prepare(
+                "SELECT a.id, p.handle || '/' || a.label, a.last_seen_at FROM memberships m
+                 JOIN agents a ON a.id = m.agent_id JOIN persons p ON p.id = a.person_id
+                 WHERE m.room_id = ?1 AND m.status = 'member' ORDER BY 2",
+            )?;
+            let members = stmt
+                .query_map([r.id], |row| {
+                    let seen: Option<i64> = row.get(2)?;
+                    Ok(MemberView {
+                        agent_id: row.get(0)?,
+                        agent: row.get(1)?,
+                        presence: if seen.is_some_and(|s| now - s < PRESENCE_WINDOW_S) {
+                            "online".into()
+                        } else {
+                            "offline".into()
+                        },
+                    })
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            let mut stmt = conn.prepare(
+                "SELECT j.id, p.handle || '/' || a.label, j.status, j.created_at,
+                   (SELECT j2.status FROM join_requests j2 WHERE j2.room_id = j.room_id AND j2.agent_id = j.agent_id AND j2.id < j.id ORDER BY j2.id DESC LIMIT 1)
+                 FROM join_requests j JOIN agents a ON a.id = j.agent_id JOIN persons p ON p.id = a.person_id
+                 WHERE j.room_id = ?1 ORDER BY j.id DESC LIMIT 50",
+            )?;
+            let requests = stmt
+                .query_map([r.id], |row| {
+                    Ok(RequestView {
+                        id: row.get(0)?,
+                        agent: row.get(1)?,
+                        status: row.get(2)?,
+                        created_at: row.get(3)?,
+                        previous: row.get(4)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            // Last READ_LIMIT visible messages, oldest first.
+            let start = (r.last_seq - READ_LIMIT).max(floor);
+            let messages = messages_after(conn, &r, start, READ_LIMIT)?;
+            Ok(RoomDetail {
+                name: r.name.clone(),
+                owner,
+                state: r.state.clone(),
+                can_govern: r.owner_person_id == who.person_id || who.is_admin,
+                last_seq: r.last_seq,
+                members,
+                requests,
+                messages,
+            })
+        })
+        .await
+}

@@ -1,0 +1,39 @@
+[package]
+name = "agentslam"
+version = "0.2.1"
+edition = "2024"
+description = "SSO-authorized MCP rooms for coding agents with owner-confirmed admission"
+license = "UNLICENSED"
+publish = false
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["macros"] }
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "env"] }
+futures = "0.3"
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto", "use_pem"] }
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rmcp = { version = "3.9", features = ["server", "macros", "transport-streamable-http-server"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+
+[dev-dependencies]
+# Tests generate a throwaway RSA key for the fake IdP at runtime (no key files).
+rsa = { version = "0.9", features = ["getrandom"] }
+
+# RSA key generation is unusably slow unoptimized; optimize just these deps.
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
+[profile.dev.package.rsa]
+opt-level = 3

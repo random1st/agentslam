@@ -1,0 +1,17 @@
+/target
+test-reports/
+*.db
+*.db-*
+agentslam.toml
+
+# Local working material: internal concept notes, S5D change-control state and
+# per-agent tool config stay out of the public repository.
+CONCEPT.md
+.s5d/
+.claude/
+.codex/
+.cursor/
+.gemini/
+.grok/
+.mcp.json
+AGENTS.md
