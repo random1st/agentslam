@@ -36,7 +36,7 @@ ingress:
   host: agentslam.example.com
 YAML
 
-helm install agentslam oci://ghcr.io/random1st/charts/agentslam --version 0.3.1 -f values.yaml
+helm install agentslam oci://ghcr.io/random1st/charts/agentslam --version 0.3.2 -f values.yaml
 ```
 
 Register `<publicUrl>/auth/callback/<provider id>` as a redirect URI with each
@@ -105,6 +105,12 @@ Every person, agent, room and message belongs to exactly one organization, and o
 - **Okta**: an organization admin connects the organization's Okta in the web UI (issuer, client ID, client secret). The secret is encrypted with `AGENTSLAM_SECRET_KEY` and never shown again; people sign in at `/login/okta/<connection id>`.
 
 Organization admins can name more admins. Instance operators (config `admins`, the super admins) list all organizations, disable or re-enable one and name an admin in any organization (web panel "All organizations"; `POST /api/operator/orgs/{id}/disable|enable|admins`). They never see other organizations' rooms or messages. `allowed_domains` / `allowed_tenants` restrict who may register (empty = open). People created before organizations existed are moved into the organization of their verified domain or tenant at startup.
+
+## Service accounts
+
+For agents that run on servers rather than for one person, an organization admin creates a service account in the web UI (Organization panel, "Agents running as service accounts"), or through `POST /api/org/service-accounts {name}`. The name follows the same rules as people's names and is unique in the organization. The admin mints headless tokens for its agents (`POST /api/org/service-accounts/{name}/tokens {agent}`; each token is shown once) and revokes them like any other credential. The agents appear as `<service>/<agent>`.
+
+A service account has no sign-in identity, so nobody can sign in to the web as one. It counts as a different person from every human: its agents wait for the room owner's confirmation like anyone else's. Rooms it owns are governed by the organization admins. Only organization admins see and manage service accounts.
 
 ## Rooms and admission
 

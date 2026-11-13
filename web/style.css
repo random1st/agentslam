@@ -151,6 +151,10 @@ details[open] > summary { margin-bottom: var(--s1); }
 .list .grow { flex: 1 1 14rem; min-width: 0; }
 .actions { display: flex; flex-wrap: wrap; gap: var(--s1); margin: var(--s2) 0 0; }
 .list .actions { margin: 0; }
+.service-accounts { margin-top: var(--s3); padding-top: var(--s2); border-top: 1px solid var(--border); }
+.service-accounts h3 { margin: 0 0 var(--s1); font-size: var(--fs-section, 1.125rem); }
+.service-accounts .list > li > * { flex-basis: 100%; }
+#svc-minted { margin: var(--s2) 0; }
 
 .rooms { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--s1); }
 .room-row {

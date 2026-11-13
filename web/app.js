@@ -255,11 +255,91 @@ async function loadOrg() {
     if (await act(ev.submitter, "/api/org/okta", body, "Okta connected.")) loadOrg();
   });
   setContent("org-body", el("p", { class: "help small" }, `You are an admin of ${org.name}. People who sign in with a ${org.name} account join automatically.`),
-    admins, addAdmin,
+    admins, addAdmin, serviceAccountsBlock(),
     el("details", { open: org.okta_connections.length ? true : null },
       el("summary", {}, org.okta_connections.length ? "Company sign-in (Okta)" : "Connect your company's Okta"),
       okta,
       org.can_store_secrets ? oktaForm : el("p", { class: "help small" }, "Connecting Okta needs the server's secret key, which is not set. Ask the person who runs this server.")));
+}
+
+// Service accounts (org admins only): agents that run on servers under a
+// name of the organization instead of a person. Nobody signs in as one.
+function serviceAccountsBlock() {
+  const box = el("section", { class: "service-accounts", "aria-labelledby": "svc-h" },
+    el("h3", { id: "svc-h" }, "Agents running as service accounts"),
+    el("p", { class: "help small" }, "For agents on servers that don't belong to one person. Nobody can sign in as a service account; its agents join rooms only after the room owner lets them in."));
+  const list = el("div", { id: "svc-list", "aria-busy": "true" }, el("p", { class: "empty" }, "Loading service accounts…"));
+  const minted = el("div", { id: "svc-minted", hidden: true });
+  const create = el("form", { class: "inline-form", novalidate: true },
+    el("div", { class: "field" }, el("label", { for: "svc-name" }, "New service account"),
+      el("input", { id: "svc-name", placeholder: "for example build-bots", autocomplete: "off" })),
+    el("button", { type: "submit" }, "Create"));
+  create.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const name = $("svc-name").value.trim();
+    if (!/^[a-z0-9-]{2,32}$/.test(name)) { inlineError(ev.submitter, "Use 2 to 32 lowercase letters, digits or dashes, for example build-bots."); return; }
+    if (await act(ev.submitter, "/api/org/service-accounts", { name }, `Service account ${name} created.`)) { $("svc-name").value = ""; loadServiceAccounts(); }
+  });
+  box.append(list, minted, create);
+  setTimeout(loadServiceAccounts, 0);
+  return box;
+}
+
+async function loadServiceAccounts() {
+  const list = $("svc-list"); if (!list) return;
+  let data;
+  try { data = await api("/api/org/service-accounts"); }
+  catch (e) { setContent("svc-list", stateBox("error", `Couldn't load service accounts. ${e.message}`, loadServiceAccounts)); return; }
+  if (!data.service_accounts.length) { setContent("svc-list", el("p", { class: "empty" }, "No service accounts yet.")); return; }
+  const ul = el("ul", { class: "list" });
+  for (const s of data.service_accounts) {
+    const agents = el("div", {});
+    for (const a of s.agents) {
+      const name = `${s.name}/${a.label}`;
+      const row = el("div", { class: "agent-row" },
+        el("div", { class: "grow" }, el("div", { class: "name" }, name),
+          el("span", { class: `presence ${a.online ? "online" : "offline"}` }, a.online ? "Online" : "Offline"),
+          el("div", { class: "meta" }, a.credentials.length ? `${a.credentials.length} access ${a.credentials.length === 1 ? "token" : "tokens"}` : "no access token")));
+      if (a.credentials.length) {
+        const btn = el("button", { type: "button", class: "small-btn", "aria-label": `Revoke access of ${name}` }, "Revoke…");
+        btn.addEventListener("click", async () => {
+          const yes = await confirmAction({ title: `Revoke access of ${name}?`, body: `All tokens of ${name} stop working right away and any wait it has open ends. You can create a new token later.`, ok: `Revoke ${name}` });
+          if (!yes) return;
+          let ok = true;
+          for (const c of a.credentials) ok = (await act(btn, `/api/credentials/${encodeURIComponent(c.family_id)}/revoke`, undefined, `${name} was disconnected.`)) && ok;
+          if (ok) loadServiceAccounts();
+        });
+        row.append(btn);
+      }
+      agents.append(row);
+    }
+    const inputId = `svc-agent-${s.name}`;
+    const mint = el("form", { class: "inline-form", novalidate: true },
+      el("div", { class: "field" }, el("label", { for: inputId }, `Agent name for ${s.name}`),
+        el("input", { id: inputId, placeholder: "for example operator", autocomplete: "off" })),
+      el("button", { type: "submit", class: "small-btn" }, "Create access token"));
+    mint.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const agent = $(inputId).value.trim();
+      if (!/^[a-z0-9-]{2,32}$/.test(agent)) { inlineError(ev.submitter, "Use 2 to 32 lowercase letters, digits or dashes, for example operator."); return; }
+      ev.submitter.disabled = true;
+      try {
+        const r = await api(`/api/org/service-accounts/${encodeURIComponent(s.name)}/tokens`, { method: "POST", body: { agent } });
+        const box = $("svc-minted");
+        box.replaceChildren(
+          el("div", { class: "notice warn", role: "alert" }, el("p", {}, el("strong", {}, `Token for ${r.agent} created. Copy it now: it won't be shown again.`))),
+          el("div", { class: "copy-row" }, el("input", { type: "text", readonly: true, value: r.token, "aria-label": `Access token for ${r.agent}` }), copyButton(() => r.token, "access token")),
+          el("p", { class: "help small" }, "Store it as AGENTSLAM_TOKEN on that server."));
+        box.hidden = false;
+        announce(`Access token for ${r.agent} created. Copy it now.`);
+        loadServiceAccounts();
+      } catch (e) { inlineError(ev.submitter, e.message); }
+      finally { ev.submitter.disabled = false; }
+    });
+    ul.append(el("li", {}, el("div", { class: "grow" }, el("strong", {}, s.name),
+      s.agents.length ? agents : el("p", { class: "empty" }, "No agents yet.")), mint));
+  }
+  setContent("svc-list", ul);
 }
 
 async function loadOperator() {

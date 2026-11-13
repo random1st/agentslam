@@ -52,6 +52,14 @@ pub fn routes() -> Router<Shared> {
         .route("/api/org", get(org_info))
         .route("/api/org/admins", post(org_add_admin))
         .route("/api/org/okta", post(org_add_okta))
+        .route(
+            "/api/org/service-accounts",
+            get(service_accounts).post(create_service_account),
+        )
+        .route(
+            "/api/org/service-accounts/{name}/tokens",
+            post(mint_service_token),
+        )
         .route("/api/operator/orgs", get(operator_orgs))
         .route(
             "/api/operator/orgs/{id}/disable",
@@ -252,21 +260,27 @@ async fn mint_token(
     Json(req): Json<MintRequest>,
 ) -> Result<Response> {
     check_csrf(&user.session, &headers, None)?;
+    mint_for(&state, user.person_id, &user.handle, req.label).await
+}
+
+/// The one token path for people and service accounts: get or create the
+/// agent `<owner>/<label>` of `person_id`, mint a headless token, return it
+/// once (`no-store`).
+async fn mint_for(state: &Shared, pid: i64, owner: &str, label: String) -> Result<Response> {
     let now = state.clock.now();
-    let pid = user.person_id;
     let resource = state.config.mcp_resource();
-    let label = req.label.clone();
+    let l = label.clone();
     let (raw, family) = state
         .db
         .call(move |c| {
-            let agent_id = people::agent_get_or_create(c, pid, &label, now)?;
+            let agent_id = people::agent_get_or_create(c, pid, &l, now)?;
             tokens::mint_agent_token(c, agent_id, &resource, now)
         })
         .await?;
     let mut resp = (
         StatusCode::CREATED,
         Json(json!({
-            "agent": format!("{}/{}", user.handle, req.label),
+            "agent": format!("{owner}/{label}"),
             "token": raw,
             "family_id": family,
             "note": "shown once; store it in your secret manager",
@@ -420,7 +434,7 @@ async fn org_add_admin(
         .db
         .call(move |c| {
             let pid: i64 = rusqlite::OptionalExtension::optional(c.query_row(
-                "SELECT id FROM persons WHERE handle = ?1 AND org_id = ?2",
+                "SELECT id FROM persons WHERE handle = ?1 AND org_id = ?2 AND is_service = 0",
                 rusqlite::params![req.handle, org_id],
                 |r| r.get(0),
             ))?
@@ -485,6 +499,81 @@ async fn org_add_okta(
         Json(json!({"id": id, "sign_in_path": format!("/login/okta/{id}")})),
     )
         .into_response())
+}
+
+// ---------------------------------------------------------------- service accounts (B13a)
+
+#[derive(Deserialize)]
+struct ServiceAccountRequest {
+    name: String,
+}
+
+/// An org admin creates a service account: a person of the organization
+/// with no sign-in identity, for agents that run on servers.
+async fn create_service_account(
+    State(state): State<Shared>,
+    user: WebUser,
+    headers: HeaderMap,
+    Json(req): Json<ServiceAccountRequest>,
+) -> Result<Response> {
+    check_csrf(&user.session, &headers, None)?;
+    require_org_admin(&user)?;
+    let org_id = user.org_id;
+    let now = state.clock.now();
+    let name = req.name.trim().to_string();
+    let n = name.clone();
+    state
+        .db
+        .call(move |c| people::create_service_account(c, org_id, &n, now))
+        .await?;
+    Ok((StatusCode::CREATED, Json(json!({"name": name}))).into_response())
+}
+
+/// The organization's service accounts with their agents (org admins only).
+async fn service_accounts(
+    State(state): State<Shared>,
+    user: WebUser,
+) -> Result<Json<serde_json::Value>> {
+    require_org_admin(&user)?;
+    let org_id = user.org_id;
+    let now = state.clock.now();
+    let accounts: Vec<serde_json::Value> = state
+        .db
+        .call(move |c| {
+            let mut out = Vec::new();
+            for (pid, name, created_at) in people::service_accounts(c, org_id)? {
+                let agents = people::agents_of_person(c, pid, now)?;
+                out.push(json!({"name": name, "created_at": created_at, "agents": agents}));
+            }
+            Ok(out)
+        })
+        .await?;
+    Ok(Json(json!({"service_accounts": accounts})))
+}
+
+#[derive(Deserialize)]
+struct ServiceTokenRequest {
+    agent: String,
+}
+
+/// Mint a headless token for an agent of a service account (shown once).
+/// Revocation is the normal credential revoke, which org admins may use.
+async fn mint_service_token(
+    State(state): State<Shared>,
+    user: WebUser,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(req): Json<ServiceTokenRequest>,
+) -> Result<Response> {
+    check_csrf(&user.session, &headers, None)?;
+    require_org_admin(&user)?;
+    let org_id = user.org_id;
+    let n = name.clone();
+    let pid = state
+        .db
+        .call(move |c| people::service_account_id(c, org_id, &n))
+        .await?;
+    mint_for(&state, pid, &name, req.agent.trim().to_string()).await
 }
 
 /// Instance operators (config `admins`, the super admins, B13) list
@@ -570,7 +659,7 @@ async fn operator_add_admin(
         .db
         .call(move |c| {
             let pid: i64 = rusqlite::OptionalExtension::optional(c.query_row(
-                "SELECT id FROM persons WHERE handle = ?1 AND org_id = ?2",
+                "SELECT id FROM persons WHERE handle = ?1 AND org_id = ?2 AND is_service = 0",
                 rusqlite::params![req.handle.trim(), id],
                 |r| r.get(0),
             ))?

@@ -204,7 +204,8 @@ pub fn ensure_person(
 
 /// Admin action: attach the identity (issuer, sub) to an existing person of
 /// the admin's organization. An identity already belonging to a person of
-/// another organization cannot be moved (B13).
+/// another organization cannot be moved (B13), and a service account never
+/// gets an identity (B13a: nobody can sign in as one).
 pub fn link_identity(
     conn: &Connection,
     org_id: i64,
@@ -214,7 +215,7 @@ pub fn link_identity(
 ) -> Result<()> {
     let person_id: i64 = conn
         .query_row(
-            "SELECT id FROM persons WHERE handle = ?1 AND org_id = ?2",
+            "SELECT id FROM persons WHERE handle = ?1 AND org_id = ?2 AND is_service = 0",
             params![handle, org_id],
             |r| r.get(0),
         )
@@ -229,6 +230,67 @@ pub fn link_identity(
         return Err(Error::NotFound);
     }
     Ok(())
+}
+
+/// Whether the person is a service account (B13a).
+pub fn is_service_person(conn: &Connection, person_id: i64) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT is_service <> 0 FROM persons WHERE id = ?1",
+            [person_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(false))
+}
+
+/// B13a: an org admin creates a service account, a person of `org_id` with
+/// `name` (same rules as handles, unique in the organization, also among
+/// people) and no identity. Returns its person id.
+pub fn create_service_account(conn: &Connection, org_id: i64, name: &str, now: i64) -> Result<i64> {
+    if !valid_slug(name, 2, MAX_HANDLE_LEN) {
+        return Err(Error::BadRequest(
+            "use 2 to 32 lowercase letters, digits or dashes".to_string(),
+        ));
+    }
+    let taken: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM persons WHERE handle = ?1 AND org_id = ?2)",
+        params![name, org_id],
+        |r| r.get(0),
+    )?;
+    if taken {
+        return Err(Error::Conflict(format!(
+            "the name {name} is already used in your organization"
+        )));
+    }
+    conn.execute(
+        "INSERT INTO persons (handle, org_id, created_at, is_service) VALUES (?1, ?2, ?3, 1)",
+        params![name, org_id, now],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Person id of the service account `name` in `org_id`; another
+/// organization's account or a human person is "not found".
+pub fn service_account_id(conn: &Connection, org_id: i64, name: &str) -> Result<i64> {
+    conn.query_row(
+        "SELECT id FROM persons WHERE handle = ?1 AND org_id = ?2 AND is_service = 1",
+        params![name, org_id],
+        |r| r.get(0),
+    )
+    .optional()?
+    .ok_or(Error::NotFound)
+}
+
+/// Service accounts of `org_id` (id, name, created_at), by name.
+pub fn service_accounts(conn: &Connection, org_id: i64) -> Result<Vec<(i64, String, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, handle, created_at FROM persons WHERE org_id = ?1 AND is_service = 1 ORDER BY handle",
+    )?;
+    let rows = stmt
+        .query_map([org_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
 }
 
 pub fn agent_get_or_create(

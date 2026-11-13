@@ -50,7 +50,11 @@ fn expected_test_names(spec: &str) -> Vec<String> {
 
 /// Criteria implemented in a later step of the current change. Anything
 /// missing that is not listed here fails the test. Must be empty at the end.
-const PLANNED: &[&str] = &[];
+const PLANNED: &[&str] = &[
+    // 0.3.3: room_decide via MCP elicitation and the service-token CLI.
+    "s5d_ac_uc_agentslam_orgs_decide_elicitation",
+    "s5d_ac_uc_agentslam_orgs_service_token_cli",
+];
 
 #[test]
 fn every_acceptance_criterion_has_a_test() {
@@ -61,7 +65,7 @@ fn every_acceptance_criterion_has_a_test() {
     let expected = expected_test_names(&spec);
     assert_eq!(
         expected.len(),
-        52,
+        55,
         "spec acceptance count changed: {expected:?}"
     );
     for p in PLANNED {

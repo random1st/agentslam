@@ -100,6 +100,9 @@ pub async fn load_session(state: &Shared, headers: &HeaderMap) -> Result<Option<
             };
             let is_operator = people::is_operator(&cfg, &identity);
             let (person_id, handle, org) = match identity.person_id {
+                // A service account never carries a web session (B13a). It has
+                // no identity, so this is defence in depth against a bad link.
+                Some(pid) if people::is_service_person(c, pid)? => return Ok(None),
                 Some(pid) => match crate::identity::orgs::org_of_person(c, pid)? {
                     // A disabled organization signs everyone out (B13).
                     Some(org) if org.disabled => return Ok(None),

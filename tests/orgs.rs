@@ -508,6 +508,222 @@ async fn s5d_ac_uc_agentslam_orgs_org_oidc_fixed() {
     assert_eq!(count(&env, "SELECT COUNT(*) FROM organizations").await, 1);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn s5d_ac_uc_agentslam_orgs_service_account() {
+    let env = Env::start().await;
+    let roman_agent = env.agent("roman", "claude-pm").await; // roman creates example.com: admin
+    let roman = env.person("roman").await;
+    let alex = env.person("alex").await; // regular member
+    let alex_agent = env.agent("alex", "codex").await;
+    roman_agent
+        .ok(
+            "room_create",
+            json!({"name": "ios", "topic": "iOS release coordination"}),
+        )
+        .await;
+    assert_eq!(roman.get_json("/api/org").await["is_admin"], json!(true));
+    assert_eq!(alex.get_json("/api/org").await["is_admin"], json!(false));
+
+    // Only org admins create, list and mint; CSRF is required.
+    let create = json!({"name": "fleet-agents"});
+    assert_eq!(
+        alex.post_api("/api/org/service-accounts", Some(create.clone()))
+            .await
+            .status(),
+        403,
+        "a regular member gets 403"
+    );
+    assert_eq!(alex.get("/api/org/service-accounts").await.status(), 403);
+    assert_eq!(
+        roman
+            .post_api_with("/api/org/service-accounts", Some(create.clone()), None)
+            .await
+            .status(),
+        403,
+        "CSRF"
+    );
+    assert_eq!(
+        roman
+            .post_api("/api/org/service-accounts", Some(create.clone()))
+            .await
+            .status(),
+        201
+    );
+    for (body, status) in [
+        (create.clone(), 409),
+        (json!({"name": "alex"}), 409),
+        (json!({"name": "Bad Name"}), 400),
+    ] {
+        assert_eq!(
+            roman
+                .post_api("/api/org/service-accounts", Some(body.clone()))
+                .await
+                .status(),
+            status,
+            "{body}"
+        );
+    }
+    let token_path = "/api/org/service-accounts/fleet-agents/tokens";
+    assert_eq!(
+        alex.post_api(token_path, Some(json!({"agent": "operator"})))
+            .await
+            .status(),
+        403
+    );
+    assert_eq!(
+        roman
+            .post_api(
+                "/api/org/service-accounts/roman/tokens",
+                Some(json!({"agent": "x1"}))
+            )
+            .await
+            .status(),
+        404,
+        "a human is not a service account"
+    );
+    let r = roman
+        .post_api(token_path, Some(json!({"agent": "operator"})))
+        .await;
+    assert_eq!(r.status(), 201);
+    assert_eq!(
+        r.headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+    let minted: Value = r.json().await.expect("json");
+    assert_eq!(minted["agent"], json!("fleet-agents/operator"));
+    let token = minted["token"].as_str().expect("token").to_string();
+    let family = minted["family_id"].as_str().expect("family").to_string();
+    let operator = Mcp::new(&env.base, &token);
+
+    // operator appears as fleet-agents/operator; its request waits for roman.
+    let list = operator.ok("room_list", json!({})).await;
+    assert_eq!(list["caller"], json!("fleet-agents/operator"));
+    let join = operator
+        .ok("room_request_join", json!({"room": "ios"}))
+        .await;
+    assert_eq!(join["status"], json!("pending"), "no auto-admit");
+    assert_eq!(
+        operator
+            .err("room_read", json!({"room": "ios", "since": 0}))
+            .await,
+        "not_a_member"
+    );
+    let banner = roman.get_json("/api/requests").await;
+    assert!(
+        banner["requests"]
+            .as_array()
+            .expect("requests")
+            .iter()
+            .any(|r| r["room"] == "ios" && r["agent"] == "fleet-agents/operator")
+    );
+    env.confirm_pending("roman", "ios", "fleet-agents/operator")
+        .await;
+    assert_eq!(
+        operator.room_status("ios").await.expect("ios")["status"],
+        json!("member")
+    );
+
+    // The admin sees the account with its agent, presence and credential.
+    let accounts = roman.get_json("/api/org/service-accounts").await;
+    let acct = &accounts["service_accounts"][0];
+    assert_eq!(acct["name"], json!("fleet-agents"));
+    assert_eq!(acct["agents"][0]["label"], json!("operator"));
+    assert_eq!(acct["agents"][0]["online"], json!(true));
+    assert_eq!(
+        acct["agents"][0]["credentials"][0]["family_id"],
+        json!(family)
+    );
+    assert!(!accounts.to_string().contains(&token), "token shown once");
+
+    // A room owned by the service account is governed by the org admins.
+    operator
+        .ok(
+            "room_create",
+            json!({"name": "ops", "topic": "Server-side operator agents"}),
+        )
+        .await;
+    alex_agent
+        .ok("room_request_join", json!({"room": "ops"}))
+        .await;
+    let banner = roman.get_json("/api/requests").await;
+    assert!(
+        banner["requests"]
+            .as_array()
+            .expect("requests")
+            .iter()
+            .any(|r| r["room"] == "ops" && r["agent"] == "alex/codex"),
+        "the org admin is the implicit owner: {banner}"
+    );
+    assert_eq!(alex.get_json("/api/requests").await["requests"], json!([]));
+    env.confirm_pending("roman", "ops", "alex/codex").await;
+    assert_eq!(
+        alex_agent.room_status("ops").await.expect("ops")["status"],
+        json!("member")
+    );
+
+    // Nobody can sign in to the web as fleet-agents.
+    let sid: i64 = count(
+        &env,
+        "SELECT id FROM persons WHERE handle = 'fleet-agents'",
+    )
+    .await;
+    let identities = env
+        .server
+        .state
+        .db
+        .call(move |c| {
+            Ok(c.query_row(
+                "SELECT COUNT(*) FROM identities WHERE person_id = ?1",
+                [sid],
+                |r| r.get::<_, i64>(0),
+            )?)
+        })
+        .await
+        .expect("db");
+    assert_eq!(identities, 0, "no sign-in identity");
+    let alex_ident = alex.get_json("/api/me").await["identity"].clone();
+    let r = roman
+        .post_api(
+            "/api/admin/link",
+            Some(json!({"issuer": alex_ident["issuer"], "sub": alex_ident["sub"], "handle": "fleet-agents"})),
+        )
+        .await;
+    assert_eq!(
+        r.status(),
+        404,
+        "an identity cannot be linked to a service account"
+    );
+    let (b, cb) = sign_in_as(
+        &env,
+        "google",
+        json!({"sub": "g-pa", "email": "fleet-agents@example.com", "hd": "example.com"}),
+    )
+    .await;
+    assert_eq!(location(&cb), "/");
+    let me = b.get_json("/api/me").await;
+    assert_ne!(
+        me["handle"],
+        json!("fleet-agents"),
+        "the same email local part becomes a new person, never the service account"
+    );
+    assert!(
+        !me["agents"].to_string().contains("operator"),
+        "no access to the service account's agents"
+    );
+
+    // Revoke through the normal credential revoke.
+    let r = roman
+        .post_api(&format!("/api/credentials/{family}/revoke"), None)
+        .await;
+    assert_eq!(r.status(), 200);
+    let (status, _) = operator
+        .rpc_raw("tools/call", json!({"name": "room_list", "arguments": {}}))
+        .await;
+    assert_eq!(status, 401, "revoked");
+}
+
 /// The instance operator (super admin) of a.com, for operator tests.
 async fn env_with_operator() -> Env {
     Env::start_with(|c| {
