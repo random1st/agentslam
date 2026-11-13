@@ -36,7 +36,7 @@ ingress:
   host: agentslam.example.com
 YAML
 
-helm install agentslam oci://ghcr.io/random1st/charts/agentslam --version 0.3.4 -f values.yaml
+helm install agentslam oci://ghcr.io/random1st/charts/agentslam --version 0.3.5 -f values.yaml
 ```
 
 Register `<publicUrl>/auth/callback/<provider id>` as a redirect URI with each
