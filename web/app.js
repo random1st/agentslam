@@ -129,7 +129,7 @@ async function loadMe() {
   org.textContent = me.org.name; org.hidden = false; org.title = "Your organization";
   renderConnect();
   renderAgents();
-  $("hero").hidden = me.agents.length > 0;
+  $("hero").hidden = me.agents.length > 0 || !$("connect-page").hidden || !$("room-view").hidden;
   $("add-agent").hidden = me.agents.length === 0;
 }
 
@@ -166,6 +166,7 @@ function connectSteps() {
 }
 
 function renderConnect() {
+  document.querySelector(".page-steps").replaceChildren(connectSteps());
   document.querySelector(".hero-steps").replaceChildren(connectSteps());
   document.querySelector(".dialog-steps").replaceChildren(connectSteps());
 }
@@ -464,9 +465,22 @@ async function loadRooms() {
 
 // ------------------------------------------------------------ one room (two panes)
 
+/** The always-reachable setup guide (top bar link, #connect). */
+function showConnect() {
+  if (stream) { stream.close(); stream = null; }
+  currentRoom = null;
+  $("room-view").hidden = true; $("home").hidden = true; $("hero").hidden = true;
+  $("connect-page").hidden = false;
+  $("connect-h").focus();
+}
+$("page-token").addEventListener("click", () => openConnect(true));
+document.querySelector(".back-home").addEventListener("click", (ev) => { ev.preventDefault(); showHome(); loadRooms(); $("rooms-h").focus(); });
+window.addEventListener("hashchange", () => { if (location.hash === "#connect") showConnect(); });
+
 function showHome() {
   if (stream) { stream.close(); stream = null; }
   currentRoom = null;
+  $("connect-page").hidden = true;
   $("room-view").hidden = true; $("home").hidden = false;
   $("hero").hidden = !me || me.agents.length > 0;
   if (location.hash) history.replaceState(null, "", location.pathname);
@@ -480,7 +494,7 @@ async function openRoom(name, keepStream) {
   currentRoom = name;
   if (location.hash !== `#room=${encodeURIComponent(name)}`) history.replaceState(null, "", `#room=${encodeURIComponent(name)}`);
   const view = $("room-view");
-  view.hidden = false; $("home").hidden = true; $("hero").hidden = true;
+  view.hidden = false; $("home").hidden = true; $("hero").hidden = true; $("connect-page").hidden = true;
   if (changed) view.replaceChildren(backButton(), el("h1", { id: "room-h", tabindex: "-1" }, name), stateBox("loading", "Loading room…"));
   let d;
   try { d = await api(`/api/rooms/${encodeURIComponent(name)}`); }
@@ -650,6 +664,7 @@ async function refreshAll() {
   const m = location.hash.match(/^#room=(.+)$/);
   if (linked) await openRoom(linked);
   else if (m) await openRoom(decodeURIComponent(m[1]));
+  else if (location.hash === "#connect") showConnect();
   if (wantsRequests && $("requests")) { $("requests").scrollIntoView(); $("requests").focus(); }
   setInterval(() => { loadMe().catch(() => {}); loadRequests(); if (currentRoom) openRoom(currentRoom, true); else loadRooms(); }, 30000);
 })();

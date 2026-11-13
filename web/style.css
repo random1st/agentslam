@@ -273,3 +273,9 @@ dialog h2 { margin-bottom: var(--s1); }
 .app-guide { margin-top: var(--s2); border: 1px solid var(--border); border-radius: var(--radius); padding: var(--s2) var(--s3); background: var(--surface); }
 .app-guide > summary { cursor: pointer; font-weight: 600; }
 .app-guide .guide { margin: var(--s2) 0 0; padding-left: 1.25rem; display: grid; gap: var(--s1); }
+
+/* Top bar link to the setup guide, and the guide page itself. */
+.nav-link { color: var(--text); text-decoration: none; font-weight: 600; padding: 6px 10px; border-radius: 8px; }
+.nav-link:hover { background: var(--accent-weak); }
+.connect-page { max-width: 52rem; margin: 0 auto; display: grid; gap: var(--s3); }
+.connect-page .back-home { justify-self: start; }
