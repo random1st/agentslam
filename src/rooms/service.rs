@@ -182,6 +182,17 @@ fn require_member(
     Ok((room, adm))
 }
 
+fn has_grant(conn: &Connection, room_id: i64, person_id: i64) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM room_grants WHERE room_id = ?1 AND person_id = ?2",
+            params![room_id, person_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
 /// Lazily mark pending requests older than 7 days as expired.
 pub fn expire_requests(conn: &Connection, now: i64) -> Result<()> {
     conn.execute(
@@ -426,7 +437,9 @@ pub async fn request_join(state: &Shared, caller: &Caller, room: String) -> Resu
             if member_admission(&tx, r.id, c.agent_id)?.is_some() {
                 return Ok((r.id, JoinOutcome { room, status: "member".into(), request_id: None }, false, vec![]));
             }
-            if r.owner_person_id == c.person_id {
+            // The owner's own agents, and agents of a person who joined through
+            // an invite link (B5a), are admitted at once.
+            if r.owner_person_id == c.person_id || has_grant(&tx, r.id, c.person_id)? {
                 tx.execute(
                     "INSERT INTO memberships (room_id, agent_id, status, admission_seq, updated_at) VALUES (?1, ?2, 'member', ?3, ?4)
                      ON CONFLICT (room_id, agent_id) DO UPDATE SET status = 'member', admission_seq = excluded.admission_seq, updated_at = excluded.updated_at",
@@ -624,33 +637,9 @@ async fn post_item(
         .db
         .call(move |conn| {
             let tx = conn.transaction()?;
-            let (r, _) = require_member(&tx, c.org_id, &room, c.agent_id)?;
-            if r.state == "archived" {
-                return Err(Error::RoomArchived);
-            }
-            let n = text.chars().count();
-            if n == 0 || n > max_chars {
-                return Err(Error::InvalidText);
-            }
-            let seq = r.last_seq + 1;
-            tx.execute("UPDATE rooms SET last_seq = ?2 WHERE id = ?1", params![r.id, seq])?;
-            tx.execute(
-                "INSERT INTO messages (room_id, seq, agent_id, text, created_at, kind) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![r.id, seq, c.agent_id, text, now, kind],
-            )?;
+            let (r, msg) = insert_item(&tx, &c, &room, text, kind, max_chars, now)?;
             tx.commit()?;
-            Ok((
-                r.id,
-                Message {
-                    kind: kind.to_string(),
-                    room: r.name,
-                    seq,
-                    from: c.display(),
-                    text,
-                    at: now,
-                    to: None,
-                },
-            ))
+            Ok((r.id, msg))
         })
         .await?;
     state.hub.publish(Event::Message {
@@ -658,6 +647,142 @@ async fn post_item(
         seq: msg.seq,
     });
     Ok(msg)
+}
+
+/// Store one agent-written item in an open transaction (B6, B6a).
+fn insert_item(
+    tx: &Connection,
+    c: &Caller,
+    room: &str,
+    text: String,
+    kind: &'static str,
+    max_chars: usize,
+    now: i64,
+) -> Result<(Room, Message)> {
+    let (r, _) = require_member(tx, c.org_id, room, c.agent_id)?;
+    if r.state == "archived" {
+        return Err(Error::RoomArchived);
+    }
+    let n = text.chars().count();
+    if n == 0 || n > max_chars {
+        return Err(Error::InvalidText);
+    }
+    let seq = r.last_seq + 1;
+    tx.execute(
+        "UPDATE rooms SET last_seq = ?2 WHERE id = ?1",
+        params![r.id, seq],
+    )?;
+    tx.execute(
+        "INSERT INTO messages (room_id, seq, agent_id, text, created_at, kind) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![r.id, seq, c.agent_id, text, now, kind],
+    )?;
+    let msg = Message {
+        kind: kind.to_string(),
+        room: r.name.clone(),
+        seq,
+        from: c.display(),
+        text,
+        at: now,
+        to: None,
+    };
+    Ok((r, msg))
+}
+
+/// Result of `room_send` (B6, B6b). Without a session only the stored message.
+#[derive(Debug, Serialize)]
+pub struct SendResult {
+    #[serde(flatten)]
+    pub message: Message,
+    /// Items of the room after the session cursor that this agent had not seen.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unread: Option<Vec<Message>>,
+    /// With `wait_reply_s`: the items that arrived after the message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply: Option<Vec<Message>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_timed_out: Option<bool>,
+}
+
+/// `room_send` with the pair loop (B6b): with a session the send also reads
+/// the room for this session, and `wait_reply_s` then waits for the answer.
+pub async fn send_and_read(
+    state: &Shared,
+    caller: &Caller,
+    room: String,
+    text: String,
+    session: Option<String>,
+    wait_reply_s: Option<u64>,
+) -> Result<SendResult> {
+    let Some(session) = session else {
+        if wait_reply_s.is_some() {
+            return Err(Error::BadRequest(
+                "wait_reply_s needs session: pass your agentslam session id".into(),
+            ));
+        }
+        let message = send(state, caller, room, text).await?;
+        return Ok(SendResult {
+            message,
+            unread: None,
+            reply: None,
+            reply_timed_out: None,
+        });
+    };
+    let session = validate_session(&session)?;
+    if wait_reply_s.is_some_and(|s| !(1..=MAX_WAIT_S).contains(&s)) {
+        return Err(Error::BadRequest(format!(
+            "wait_reply_s is 1..{MAX_WAIT_S}"
+        )));
+    }
+    attach(state, caller, session.clone(), room.clone()).await?;
+    let now = state.clock.now();
+    let c = caller.clone();
+    let sk = session.clone();
+    let (room_id, message, unread) = state
+        .db
+        .call(move |conn| {
+            let tx = conn.transaction()?;
+            let (r, adm) = require_member(&tx, c.org_id, &room, c.agent_id)?;
+            let cursor: i64 = tx.query_row(
+                "SELECT cursor FROM session_rooms WHERE agent_id = ?1 AND session_key = ?2 AND room_id = ?3",
+                params![c.agent_id, sk, r.id],
+                |row| row.get(0),
+            )?;
+            let unread = member_items(&tx, &r, c.agent_id, adm, cursor, now)?;
+            let (r, message) = insert_item(&tx, &c, &room, text, KIND_MESSAGE, MAX_TEXT_CHARS, now)?;
+            // A full page means more is left unread: move only past what was delivered.
+            let upto = match unread.last() {
+                Some(last) if unread.len() as i64 >= READ_LIMIT => last.seq,
+                _ => message.seq,
+            };
+            advance_cursor(&tx, c.agent_id, &sk, r.id, upto)?;
+            tx.commit()?;
+            Ok((r.id, message, unread))
+        })
+        .await?;
+    state.hub.publish(Event::Message {
+        room_id,
+        seq: message.seq,
+    });
+    let (reply, reply_timed_out) = match wait_reply_s {
+        Some(secs) => {
+            let w = wait(
+                state,
+                caller,
+                session,
+                Some(vec![message.room.clone()]),
+                secs,
+            )
+            .await?;
+            (Some(w.messages), Some(w.timed_out))
+        }
+        None => (None, None),
+    };
+    Ok(SendResult {
+        message,
+        unread: Some(unread),
+        reply,
+        reply_timed_out,
+    })
 }
 
 /// `room_read` has no session argument (contract), so it never moves session cursors.
@@ -987,6 +1112,11 @@ pub async fn remove_member(state: &Shared, who: Person, room: String, agent_id: 
                 "DELETE FROM session_rooms WHERE agent_id = ?1 AND room_id = ?2",
                 params![agent_id, r.id],
             )?;
+            // B5a: removal also withdraws the access an invite gave its person.
+            conn.execute(
+                "DELETE FROM room_grants WHERE room_id = ?1 AND person_id = (SELECT person_id FROM agents WHERE id = ?2)",
+                params![r.id, agent_id],
+            )?;
             Ok(r.id)
         })
         .await?;
@@ -1293,4 +1423,238 @@ pub async fn room_detail(state: &Shared, who: Person, room: String) -> Result<Ro
             })
         })
         .await
+}
+
+// ---------------------------------------------------------------- invite links (B5a)
+
+pub const INVITE_DEFAULT_HOURS: i64 = 24;
+pub const INVITE_MAX_HOURS: i64 = 168;
+pub const INVITE_DEFAULT_USES: i64 = 1;
+pub const INVITE_MAX_USES: i64 = 20;
+pub const INVITE_INVALID: &str = "This invite link is not valid: it expired, was used up or revoked, or is for another organization. Ask the room owner for a new one.";
+
+#[derive(Debug, Serialize)]
+pub struct InviteView {
+    pub id: i64,
+    pub created_by: String,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub max_uses: i64,
+    pub uses: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InvitePreview {
+    pub room: String,
+    pub topic: String,
+    pub owner: String,
+    /// Already the owner or already let in: Join changes nothing.
+    pub already: bool,
+}
+
+/// The owner or an admin creates an invite; returns the raw token once.
+pub async fn create_invite(
+    state: &Shared,
+    who: Person,
+    room: String,
+    hours: Option<i64>,
+    max_uses: Option<i64>,
+) -> Result<(String, InviteView)> {
+    let hours = hours.unwrap_or(INVITE_DEFAULT_HOURS);
+    let max_uses = max_uses.unwrap_or(INVITE_DEFAULT_USES);
+    if !(1..=INVITE_MAX_HOURS).contains(&hours) {
+        return Err(Error::BadRequest(format!(
+            "an invite lasts 1..{INVITE_MAX_HOURS} hours"
+        )));
+    }
+    if !(1..=INVITE_MAX_USES).contains(&max_uses) {
+        return Err(Error::BadRequest(format!(
+            "an invite works 1..{INVITE_MAX_USES} times"
+        )));
+    }
+    let now = state.clock.now();
+    let raw = crate::identity::tokens::random_token("asi_");
+    let hash = crate::identity::tokens::hash(&raw);
+    let view = state
+        .db
+        .call(move |conn| {
+            let r = require_governor(conn, who, &room)?;
+            if r.state != "active" {
+                return Err(Error::RoomArchived);
+            }
+            let expires_at = now + hours * 3600;
+            conn.execute(
+                "INSERT INTO room_invites (room_id, token_hash, created_by, created_at, expires_at, max_uses) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![r.id, hash, who.person_id, now, expires_at, max_uses],
+            )?;
+            let id = conn.last_insert_rowid();
+            let created_by: String = conn.query_row(
+                "SELECT handle FROM persons WHERE id = ?1",
+                [who.person_id],
+                |row| row.get(0),
+            )?;
+            Ok(InviteView {
+                id,
+                created_by,
+                created_at: now,
+                expires_at,
+                max_uses,
+                uses: 0,
+            })
+        })
+        .await?;
+    Ok((raw, view))
+}
+
+/// Open invites of a room (not revoked, not expired, not used up).
+pub async fn list_invites(state: &Shared, who: Person, room: String) -> Result<Vec<InviteView>> {
+    let now = state.clock.now();
+    state
+        .db
+        .call(move |conn| {
+            let r = require_governor(conn, who, &room)?;
+            let mut stmt = conn.prepare(
+                "SELECT i.id, p.handle, i.created_at, i.expires_at, i.max_uses, i.uses
+                 FROM room_invites i JOIN persons p ON p.id = i.created_by
+                 WHERE i.room_id = ?1 AND i.revoked_at IS NULL AND i.expires_at > ?2 AND i.uses < i.max_uses
+                 ORDER BY i.id DESC",
+            )?;
+            let rows = stmt
+                .query_map(params![r.id, now], |row| {
+                    Ok(InviteView {
+                        id: row.get(0)?,
+                        created_by: row.get(1)?,
+                        created_at: row.get(2)?,
+                        expires_at: row.get(3)?,
+                        max_uses: row.get(4)?,
+                        uses: row.get(5)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            Ok(rows)
+        })
+        .await
+}
+
+pub async fn revoke_invite(state: &Shared, who: Person, room: String, id: i64) -> Result<()> {
+    let now = state.clock.now();
+    state
+        .db
+        .call(move |conn| {
+            let r = require_governor(conn, who, &room)?;
+            let n = conn.execute(
+                "UPDATE room_invites SET revoked_at = ?3 WHERE id = ?1 AND room_id = ?2 AND revoked_at IS NULL",
+                params![id, r.id, now],
+            )?;
+            if n == 0 {
+                return Err(Error::NotFound);
+            }
+            Ok(())
+        })
+        .await
+}
+
+/// A valid invite of the person's own organization: (invite id, room).
+/// Anything else (unknown, expired, used up, revoked, another organization,
+/// a room no longer active) is the same refusal (inv.agentslam.org-isolation).
+fn valid_invite(conn: &Connection, who: Person, token_hash: &str, now: i64) -> Result<(i64, Room)> {
+    let invalid = || Error::Forbidden(INVITE_INVALID.into());
+    let found: Option<(i64, i64)> = conn
+        .query_row(
+            "SELECT i.id, i.room_id FROM room_invites i JOIN rooms r ON r.id = i.room_id
+             WHERE i.token_hash = ?1 AND r.org_id = ?2 AND r.state = 'active'
+               AND i.revoked_at IS NULL AND i.expires_at > ?3 AND i.uses < i.max_uses",
+            params![token_hash, who.org_id, now],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (id, room_id) = found.ok_or_else(invalid)?;
+    let r = room_by_id(conn, who.org_id, room_id)?.ok_or_else(invalid)?;
+    Ok((id, r))
+}
+
+fn preview_of(conn: &Connection, who: Person, r: &Room) -> Result<InvitePreview> {
+    let owner: String = conn.query_row(
+        "SELECT handle FROM persons WHERE id = ?1",
+        [r.owner_person_id],
+        |row| row.get(0),
+    )?;
+    let already = r.owner_person_id == who.person_id || has_grant(conn, r.id, who.person_id)?;
+    Ok(InvitePreview {
+        room: r.name.clone(),
+        topic: r.topic.clone(),
+        owner,
+        already,
+    })
+}
+
+/// What the invite opens, shown before the person presses Join.
+pub async fn invite_preview(state: &Shared, who: Person, token: String) -> Result<InvitePreview> {
+    let now = state.clock.now();
+    let hash = crate::identity::tokens::hash(&token);
+    state
+        .db
+        .call(move |conn| {
+            let (_, r) = valid_invite(conn, who, &hash, now)?;
+            preview_of(conn, who, &r)
+        })
+        .await
+}
+
+/// The person presses Join (B5a): grant room access, count one use, and
+/// confirm the person's agents' pending requests for the room.
+pub async fn accept_invite(state: &Shared, who: Person, token: String) -> Result<InvitePreview> {
+    let now = state.clock.now();
+    let hash = crate::identity::tokens::hash(&token);
+    let (room_id, admitted, preview) = state
+        .db
+        .call(move |conn| {
+            let tx = conn.transaction()?;
+            expire_requests(&tx, now)?;
+            let (invite_id, r) = valid_invite(&tx, who, &hash, now)?;
+            let preview = preview_of(&tx, who, &r)?;
+            if preview.already {
+                return Ok((r.id, vec![], preview));
+            }
+            tx.execute(
+                "INSERT INTO room_grants (room_id, person_id, invite_id, created_at) VALUES (?1, ?2, ?3, ?4)",
+                params![r.id, who.person_id, invite_id, now],
+            )?;
+            tx.execute(
+                "UPDATE room_invites SET uses = uses + 1 WHERE id = ?1",
+                [invite_id],
+            )?;
+            let pending: Vec<(i64, i64)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT j.id, j.agent_id FROM join_requests j JOIN agents a ON a.id = j.agent_id
+                     WHERE j.room_id = ?1 AND j.status = 'pending' AND a.person_id = ?2",
+                )?;
+                stmt.query_map(params![r.id, who.person_id], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?
+                .collect::<rusqlite::Result<_>>()?
+            };
+            for (req, agent) in &pending {
+                tx.execute(
+                    "UPDATE join_requests SET status = 'confirmed', decided_at = ?2, decided_by = ?3 WHERE id = ?1",
+                    params![req, now, who.person_id],
+                )?;
+                tx.execute(
+                    "INSERT INTO memberships (room_id, agent_id, status, admission_seq, updated_at) VALUES (?1, ?2, 'member', ?3, ?4)
+                     ON CONFLICT (room_id, agent_id) DO UPDATE SET status = 'member', admission_seq = excluded.admission_seq, updated_at = excluded.updated_at",
+                    params![r.id, agent, r.last_seq, now],
+                )?;
+            }
+            tx.commit()?;
+            let agents: Vec<i64> = pending.into_iter().map(|(_, a)| a).collect();
+            Ok((r.id, agents, preview))
+        })
+        .await?;
+    let mut events = vec![Event::RoomChanged { room_id }];
+    events.extend(admitted.into_iter().map(|agent_id| Event::AccessChanged {
+        agent_id,
+        room_id: Some(room_id),
+    }));
+    publish_all(state, events);
+    Ok(preview)
 }

@@ -65,7 +65,7 @@ fn every_acceptance_criterion_has_a_test() {
     let expected = expected_test_names(&spec);
     assert_eq!(
         expected.len(),
-        55,
+        62,
         "spec acceptance count changed: {expected:?}"
     );
     for p in PLANNED {
@@ -81,6 +81,7 @@ fn every_acceptance_criterion_has_a_test() {
         include_str!("sessions.rs"),
         include_str!("web.rs"),
         include_str!("orgs.rs"),
+        include_str!("pair.rs"),
     ]
     .concat();
     let missing: Vec<&String> = expected

@@ -4,7 +4,9 @@
 
 pub mod sse;
 
-use axum::extract::{Path, State};
+use std::collections::HashMap;
+
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
@@ -14,7 +16,7 @@ use serde_json::json;
 
 use crate::core::{Error, Result, Shared};
 use crate::identity::people;
-use crate::identity::session::{MaybeSession, WebUser, check_csrf};
+use crate::identity::session::{MaybeSession, WebUser, check_csrf, read_cookie, set_cookie};
 use crate::identity::tokens;
 use crate::rooms::notify::Event;
 use crate::rooms::service::{self, Person};
@@ -46,6 +48,14 @@ pub fn routes() -> Router<Shared> {
         .route("/api/rooms/{name}/unarchive", post(unarchive))
         .route("/api/rooms/{name}/delete", post(delete))
         .route("/api/rooms/{name}/topic", post(set_topic))
+        .route(
+            "/api/rooms/{name}/invites",
+            get(list_invites).post(create_invite),
+        )
+        .route("/api/rooms/{name}/invites/{id}/revoke", post(revoke_invite))
+        .route("/api/invite", get(invite_preview))
+        .route("/api/invite/accept", post(accept_invite))
+        .route("/api/invite/dismiss", post(dismiss_invite))
         .route("/api/agent-tokens", post(mint_token))
         .route("/api/credentials/{family}/revoke", post(revoke))
         .route("/api/admin/link", post(admin_link))
@@ -73,7 +83,37 @@ fn asset(content_type: &'static str, body: &'static str) -> Response {
     ([(header::CONTENT_TYPE, content_type)], body).into_response()
 }
 
-async fn index(MaybeSession(sess): MaybeSession) -> Response {
+/// Cookie holding an opened invite token across sign-in (B5a). It only
+/// remembers which invite to show; joining needs an explicit, CSRF-checked POST.
+const INVITE_COOKIE: &str = "agentslam_invite";
+const INVITE_COOKIE_MAX_AGE: i64 = 3600;
+
+fn plausible_invite(token: &str) -> bool {
+    (10..=100).contains(&token.len())
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+async fn index(
+    State(state): State<Shared>,
+    Query(q): Query<HashMap<String, String>>,
+    MaybeSession(sess): MaybeSession,
+) -> Response {
+    if let Some(token) = q.get("invite").filter(|t| plausible_invite(t)) {
+        let signed_in = sess.as_ref().is_some_and(|s| s.person_id.is_some());
+        let mut resp = Redirect::to(if signed_in { "/" } else { "/login" }).into_response();
+        resp.headers_mut().append(
+            header::SET_COOKIE,
+            set_cookie(
+                INVITE_COOKIE,
+                token,
+                INVITE_COOKIE_MAX_AGE,
+                state.config.secure_cookies,
+            ),
+        );
+        return resp;
+    }
     match sess {
         Some(s) if s.person_id.is_some() => (
             [
@@ -244,6 +284,108 @@ async fn set_topic(
     check_csrf(&user.session, &headers, None)?;
     service::set_topic(&state, person(&user), name, &req.topic).await?;
     Ok(ok())
+}
+
+#[derive(Deserialize)]
+struct InviteRequest {
+    hours: Option<i64>,
+    max_uses: Option<i64>,
+}
+
+/// B5a: the owner or an org admin creates an invite link, shown once.
+async fn create_invite(
+    State(state): State<Shared>,
+    user: WebUser,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(req): Json<InviteRequest>,
+) -> Result<Response> {
+    check_csrf(&user.session, &headers, None)?;
+    let (raw, view) =
+        service::create_invite(&state, person(&user), name, req.hours, req.max_uses).await?;
+    let link = format!("{}/?invite={raw}", state.config.issuer());
+    let mut resp = (
+        StatusCode::CREATED,
+        Json(json!({"link": link, "invite": view, "note": "shown once"})),
+    )
+        .into_response();
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    Ok(resp)
+}
+
+async fn list_invites(
+    State(state): State<Shared>,
+    user: WebUser,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    let invites = service::list_invites(&state, person(&user), name).await?;
+    Ok(Json(json!({"invites": invites})))
+}
+
+async fn revoke_invite(
+    State(state): State<Shared>,
+    user: WebUser,
+    headers: HeaderMap,
+    Path((name, id)): Path<(String, i64)>,
+) -> Result<Json<serde_json::Value>> {
+    check_csrf(&user.session, &headers, None)?;
+    service::revoke_invite(&state, person(&user), name, id).await?;
+    Ok(ok())
+}
+
+fn clear_invite_cookie(state: &Shared, mut resp: Response) -> Response {
+    resp.headers_mut().append(
+        header::SET_COOKIE,
+        set_cookie(INVITE_COOKIE, "", 0, state.config.secure_cookies),
+    );
+    resp
+}
+
+/// The invite this browser opened, if any, with what it opens.
+async fn invite_preview(
+    State(state): State<Shared>,
+    user: WebUser,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let Some(token) = read_cookie(&headers, INVITE_COOKIE) else {
+        return Ok(Json(json!({"invite": null})).into_response());
+    };
+    match service::invite_preview(&state, person(&user), token).await {
+        Ok(p) => Ok(Json(json!({"invite": p})).into_response()),
+        Err(Error::Forbidden(msg)) => Ok(clear_invite_cookie(
+            &state,
+            Json(json!({"invite": null, "error": msg})).into_response(),
+        )),
+        Err(e) => Err(e),
+    }
+}
+
+/// B5a: the person presses Join on the invite this browser opened.
+async fn accept_invite(
+    State(state): State<Shared>,
+    user: WebUser,
+    headers: HeaderMap,
+) -> Result<Response> {
+    check_csrf(&user.session, &headers, None)?;
+    let token = read_cookie(&headers, INVITE_COOKIE)
+        .ok_or_else(|| Error::Forbidden(service::INVITE_INVALID.into()))?;
+    let p = service::accept_invite(&state, person(&user), token).await?;
+    Ok(clear_invite_cookie(
+        &state,
+        Json(json!({"joined": p})).into_response(),
+    ))
+}
+
+async fn dismiss_invite(
+    State(state): State<Shared>,
+    user: WebUser,
+    headers: HeaderMap,
+) -> Result<Response> {
+    check_csrf(&user.session, &headers, None)?;
+    Ok(clear_invite_cookie(&state, ok().into_response()))
 }
 
 #[derive(Deserialize)]

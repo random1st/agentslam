@@ -616,9 +616,73 @@ function renderRoom(d) {
     for (const r of history) hist.append(requestItem(d.name, r, false));
     side.append(el("section", { class: "panel", "aria-label": "Owner actions" }, el("h2", {}, "Owner actions"), acts,
       history.length ? el("h3", {}, "Earlier join requests") : null, history.length ? hist : null));
+    if (d.state === "active") side.append(invitePanel(d, base));
   }
   $("room-view").replaceChildren(backButton(), head, topic, el("div", { class: "room-grid" }, transcript, side));
   log.scrollTop = log.scrollHeight;
+}
+
+// ------------------------------------------------------------ invite links (B5a)
+
+function invitePanel(d, base) {
+  const body = el("div", {});
+  const list = el("ul", { class: "list" });
+  const make = el("button", { type: "button", class: "small-btn primary" }, "Create invite link");
+  const fresh = el("div", {});
+  async function loadInvites() {
+    try {
+      const r = await api(`${base}/invites`);
+      list.replaceChildren(...r.invites.map((i) => {
+        const revoke = el("button", { type: "button", class: "small-btn", "aria-label": `Revoke the invite link created ${ago(i.created_at)}` }, "Revoke");
+        revoke.addEventListener("click", async () => { if (await act(revoke, `${base}/invites/${i.id}/revoke`, undefined, "Invite link revoked.")) loadInvites(); });
+        return el("li", {}, el("div", { class: "grow" },
+          el("div", {}, `Created by ${i.created_by} `, timeEl(i.created_at)),
+          el("span", { class: "meta" }, `used ${i.uses} of ${i.max_uses}, works until ${new Date(i.expires_at * 1000).toLocaleString()}`)), revoke);
+      }));
+    } catch (e) { list.replaceChildren(el("li", {}, e.message)); }
+  }
+  make.addEventListener("click", async () => {
+    make.disabled = true;
+    try {
+      const r = await api(`${base}/invites`, { method: "POST", body: {} });
+      fresh.replaceChildren(
+        el("p", {}, "Send this link to a colleague from your organization. It works once, for 24 hours, and is shown only now. When they press Join, their agents get into the room without waiting for you."),
+        copyRow(r.link, "invite link"));
+      announce("Invite link created.");
+      loadInvites();
+    } catch (e) { inlineError(make, e.message); }
+    finally { make.disabled = false; }
+  });
+  body.append(el("p", { class: "meta" }, "Pairing with someone? Give them a link instead of approving each of their agents."), make, fresh, list);
+  loadInvites();
+  return el("section", { class: "panel", "aria-label": "Invite a colleague" }, el("h2", {}, "Invite a colleague"), body);
+}
+
+async function showInvite() {
+  let r;
+  try { r = await api("/api/invite"); } catch (_) { return; }
+  if (!r.invite && !r.error) return;
+  const box = el("section", { class: "panel", id: "invite-banner", role: "region", "aria-label": "Room invitation" });
+  if (!r.invite) {
+    box.append(el("h2", {}, "Invite link not valid"), el("p", {}, r.error));
+  } else {
+    const i = r.invite;
+    const tell = `Join the agentslam room ${i.room} (room_request_join), attach it and pair with me there.`;
+    const done = () => box.replaceChildren(el("h2", {}, `You're in ${i.room}`),
+      el("p", {}, "Your agents now get into this room at once. Tell your agent:"), copyRow(tell, "instruction"));
+    if (i.already) done();
+    else {
+      const join = el("button", { type: "button", class: "primary" }, `Join ${i.room}`);
+      const later = el("button", { type: "button" }, "Not now");
+      join.addEventListener("click", async () => { if (await act(join, "/api/invite/accept", undefined, `You joined ${i.room}.`)) { done(); refreshAll(); } });
+      later.addEventListener("click", async () => { if (await act(later, "/api/invite/dismiss", undefined, "Invitation dismissed.")) box.remove(); });
+      box.append(el("h2", {}, `${i.owner} invites you to the room ${i.room}`),
+        i.topic ? el("p", { class: "room-topic" }, i.topic) : null,
+        el("p", {}, "If you join, every agent of yours is let into this room without waiting for the owner."),
+        el("div", { class: "actions" }, join, later));
+    }
+  }
+  $("main").prepend(box);
 }
 
 function setLive(text) { liveText = text; const l = $("live"); if (l) l.textContent = text; }
@@ -656,7 +720,7 @@ async function refreshAll() {
 (async () => {
   try { await loadMe(); }
   catch (e) { $("main").prepend(stateBox("error", `Couldn't load your account. ${e.message}`, () => location.reload())); return; }
-  await Promise.all([loadRequests(), loadRooms(), loadOrg(), loadOperator()]);
+  await Promise.all([loadRequests(), loadRooms(), loadOrg(), loadOperator(), showInvite()]);
   // Link from a join_request notice: /?room=<name>#requests opens the room
   // and moves focus to the waiting requests.
   const linked = new URLSearchParams(location.search).get("room");

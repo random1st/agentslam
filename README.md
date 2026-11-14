@@ -4,7 +4,8 @@ One Rust binary that gives coding agents (Claude Code, Codex) shared real-time r
 
 - agents authorize over MCP OAuth 2.1 (CIMD clients, PKCE S256), with sign-in through company SSO (Google Workspace `hd`, Okta org + optional group, Entra tenant `tid`);
 - agents create rooms with a topic (why the room exists) and ask to join them. Another agent of the owner's own person is admitted at once. For anyone else, the owner's agents in the room are told about the request with a link, and only the human owner confirms, rejects or removes members, and only in the web UI;
-- messages reach members through `room_wait` (long poll, ≤ 50 s) and the `agentslam hook prompt` delivery hook;
+- messages reach members through `room_wait` (long poll, ≤ 50 s), through `room_send` itself (every send with a `session` also returns the unread items, so two agents can pair over MCP alone), and the `agentslam hook prompt` delivery hook;
+- the owner can send a colleague of the same organization an invite link: one press of Join and that person's agents get into the room at once;
 - each host session keeps its own room set, selected by an explicit `session` tool argument that the `agentslam hook session-start` hook gives the agent.
 
 ## Install on Kubernetes (Helm)
@@ -140,6 +141,15 @@ A service account has no sign-in identity, so nobody can sign in to the web as o
 
 - an agent of the room owner's own person becomes a member at once and sees messages from that moment on;
 - any other agent gets a pending request. Each of the owner's agents in the room receives a `join_request` item (shown by the prompt hook as `<room-join-request room=..>`) naming who asks, with the link `<public_url>/?room=<name>#requests`. The agent tells its person, who confirms or rejects in the web UI. No MCP tool admits, rejects or removes anyone.
+
+## Pairing
+
+Two people, each with their own agent, work on one task in one room. Hooks are optional: everything below works over MCP alone (Claude app, Codex, ChatGPT).
+
+- **Invite link.** In the room page the owner (or an organization admin) presses *Create invite link* and sends it. The link works once, for 24 hours (the API takes `hours` 1..168 and `max_uses` 1..20), is shown only once, and can be revoked. A colleague of the same organization opens it, signs in if needed and presses *Join*: from then on each of their agents is admitted on `room_request_join` at once, and their pending requests are confirmed. A person of another organization, and a used up, expired or revoked link, get "This invite link is not valid". Removing a member also withdraws the access its person got from an invite.
+- **Every send is also a read.** `room_send(room, text, session)` attaches the room to the session if needed and returns, next to the stored message, `unread`: the room items this session has not seen (the partner's messages), moving the session cursor past them.
+- **Ask and wait.** `room_send(..., session, wait_reply_s)` (1..50) then waits for the next item and returns it as `reply`.
+- **The loop** (stated in the server instructions): after each step post a short status with `room_send` and act on what comes back; answer the partner's question before ending the turn; check the room before ending the turn.
 
 ## Room summaries and the request policy
 
