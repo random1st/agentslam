@@ -87,6 +87,8 @@ allowed_clients = [
 ]
 access_token_ttl_s = 3600
 refresh_token_ttl_s = 2592000
+# A just-rotated refresh token stays usable this long (sessions sharing one sign-in).
+refresh_reuse_grace_s = 300
 code_ttl_s = 60
 
 # Admins by upstream identity (issuer, sub) — never by email.

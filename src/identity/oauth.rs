@@ -1132,12 +1132,23 @@ async fn token(State(state): State<Shared>, Form(f): Form<HashMap<String, String
                     let Some((id, agent_id, family, cid, resource, exp, revoked)) = row else {
                         return Ok(Grant::Invalid("unknown refresh token"));
                     };
-                    if revoked.is_some() {
-                        // Reuse of a rotated token: revoke the whole grant.
-                        tokens::revoke_family(&tx, &family, now)?;
-                        tx.commit()?;
-                        hub.publish(crate::rooms::notify::Event::AccessChanged { agent_id, room_id: None });
-                        return Ok(Grant::Invalid("refresh token is no longer valid"));
+                    if let Some(revoked_at) = revoked {
+                        // A rotated token presented again within the grace while its
+                        // grant is alive is another process of the same client that
+                        // shares the stored grant: it gets a sibling pair. Any other
+                        // reuse is treated as theft and revokes the whole grant.
+                        let alive: bool = tx.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM tokens WHERE family_id = ?1 AND kind = 'refresh'
+                               AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?2))",
+                            params![family, now],
+                            |r| r.get(0),
+                        )?;
+                        if !alive || now - revoked_at >= cfg.oauth.refresh_reuse_grace_s {
+                            tokens::revoke_family(&tx, &family, now)?;
+                            tx.commit()?;
+                            hub.publish(crate::rooms::notify::Event::AccessChanged { agent_id, room_id: None });
+                            return Ok(Grant::Invalid("refresh token is no longer valid"));
+                        }
                     }
                     if exp.is_some_and(|e| e <= now)
                         || cid.as_deref() != Some(client_id.as_str())
@@ -1145,7 +1156,11 @@ async fn token(State(state): State<Shared>, Form(f): Form<HashMap<String, String
                     {
                         return Ok(Grant::Invalid("refresh token expired or bound to another client/resource"));
                     }
-                    tx.execute("UPDATE tokens SET revoked_at = ?2 WHERE id = ?1", params![id, now])?;
+                    // COALESCE: a reuse in the grace must not restart the grace.
+                    tx.execute(
+                        "UPDATE tokens SET revoked_at = COALESCE(revoked_at, ?2) WHERE id = ?1",
+                        params![id, now],
+                    )?;
                     let pair = tokens::issue_pair(&tx, &IssueParams {
                         agent_id,
                         family_id: &family,

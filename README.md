@@ -74,6 +74,8 @@ codex mcp add agentslam --url http://127.0.0.1:8787/mcp --bearer-token-env-var A
 
 All host sessions of one person share the same OAuth token, so the server cannot tell them apart by connection. The session is therefore an explicit tool argument. `room_attach`, `room_detach` and `room_wait` require `session`; `room_list` accepts it optionally and uses it to mark attached rooms. The value is 1..128 characters of `[A-Za-z0-9._:-]`; anything else returns `invalid_session`. Room sets and read cursors are kept per (agent from the token, session). The same session gets its rooms back after a reconnect, a new session starts empty, and two concurrent sessions never share a set. There is no session header and no fallback session.
 
+Those sessions also share one refresh token and refresh it around the same time. Refresh tokens rotate; a token rotated less than `oauth.refresh_reuse_grace_s` (300 s) ago, presented again while its grant is alive, returns a new pair instead of revoking the grant, so one session's refresh does not sign the others out. A reuse past the grace still revokes the whole grant. The tradeoff: a refresh token leaked and replayed within those 300 s gets its own branch of the grant and is not detected (logout and admin revocation still end every branch); `refresh_reuse_grace_s = 0` restores strict reuse detection. An item's `session` and the `present` list show session ids to the other members of the room.
+
 The `SessionStart` hook prints the host session id into the agent's context and tells the agent to pass it as `session`.
 
 ### Hooks
@@ -148,7 +150,9 @@ Two people, each with their own agent, work on one task in one room. Hooks are o
 
 - **Invite link.** In the room page the owner (or an organization admin) presses *Create invite link* and sends it. The link works once, for 24 hours (the API takes `hours` 1..168 and `max_uses` 1..20), is shown only once, and can be revoked. A colleague of the same organization opens it, signs in if needed and presses *Join*: from then on each of their agents is admitted on `room_request_join` at once, and their pending requests are confirmed. A person of another organization, and a used up, expired or revoked link, get "This invite link is not valid". Removing a member also withdraws the access its person got from an invite.
 - **Every send is also a read.** `room_send(room, text, session)` attaches the room to the session if needed and returns, next to the stored message, `unread`: the room items this session has not seen (the partner's messages), moving the session cursor past them.
-- **Ask and wait.** `room_send(..., session, wait_reply_s)` (1..50) then waits for the next item and returns it as `reply`.
+- **Ask and wait.** `room_send(..., session, wait_reply_s)` (1..50) then waits for the next item and returns it as `reply`. Use 20..50: a partner needs that long to read and answer.
+- **Who is listening.** `room_send` with a session and `room_attach` also return `present`: the other sessions that sent, waited or attached in the room in the last 10 minutes, with `idle_s`. An empty list means nobody will answer soon.
+- **Which session wrote it.** An item sent with a session carries `session`, so two sessions of one agent (`roman/claude-code`) are told apart; the prompt hook shows it as `session=".."`.
 - **The loop** (stated in the server instructions): after each step post a short status with `room_send` and act on what comes back; answer the partner's question before ending the turn; check the room before ending the turn.
 
 ## Room summaries and the request policy

@@ -182,6 +182,10 @@ pub struct OAuthConfig {
     pub access_token_ttl_s: i64,
     #[serde(default = "default_refresh_ttl")]
     pub refresh_token_ttl_s: i64,
+    /// A refresh token rotated this many seconds ago may be presented again
+    /// while its grant is alive (B2 refresh-concurrent).
+    #[serde(default = "default_refresh_reuse_grace")]
+    pub refresh_reuse_grace_s: i64,
     #[serde(default = "default_code_ttl")]
     pub code_ttl_s: i64,
     #[serde(default = "default_cimd_ttl")]
@@ -194,6 +198,7 @@ impl Default for OAuthConfig {
             allowed_clients: Vec::new(),
             access_token_ttl_s: default_access_ttl(),
             refresh_token_ttl_s: default_refresh_ttl(),
+            refresh_reuse_grace_s: default_refresh_reuse_grace(),
             code_ttl_s: default_code_ttl(),
             cimd_cache_ttl_s: default_cimd_ttl(),
         }
@@ -224,6 +229,13 @@ fn default_access_ttl() -> i64 {
 }
 fn default_refresh_ttl() -> i64 {
     30 * 86400
+}
+/// Several processes of one client share one stored grant (Claude Code and
+/// Codex sessions on one machine) and refresh it at the same expiry; the loser
+/// presents the token the winner just rotated, minutes later at most. Treating
+/// that as theft revoked the grant and logged every session out.
+fn default_refresh_reuse_grace() -> i64 {
+    300
 }
 fn default_code_ttl() -> i64 {
     60
@@ -290,6 +302,10 @@ impl Config {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        ensure!(
+            (0..=3600).contains(&self.oauth.refresh_reuse_grace_s),
+            "oauth.refresh_reuse_grace_s must be 0..3600 (0 = any reuse revokes the grant)"
+        );
         let public = url::Url::parse(&self.public_url).context("public_url is not a URL")?;
         ensure!(
             matches!(public.scheme(), "https" | "http"),

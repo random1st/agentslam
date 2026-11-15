@@ -268,3 +268,108 @@ async fn s5d_ac_uc_agentslam_pair_invite_removal() {
         "removal withdrew the invite access: {again}"
     );
 }
+
+fn sessions(present: &Value) -> Vec<String> {
+    present
+        .as_array()
+        .expect("present is a list")
+        .iter()
+        .map(|p| {
+            format!(
+                "{}#{}",
+                p["from"].as_str().unwrap_or(""),
+                p["session"].as_str().unwrap_or("")
+            )
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn s5d_ac_uc_agentslam_pair_send_shows_present() {
+    let env = Env::start().await;
+    let (roman, alex) = env.ios_with_alex().await;
+    let r = roman
+        .ok(
+            "room_send",
+            json!({"room": "ios", "text": "anyone?", "session": "s1"}),
+        )
+        .await;
+    assert_eq!(r["present"], json!([]), "nobody is listening yet: {r}");
+
+    let att = alex
+        .ok("room_attach", json!({"room": "ios", "session": "s9"}))
+        .await;
+    assert_eq!(
+        sessions(&att["present"]),
+        vec!["roman/claude-pm#s1"],
+        "{att}"
+    );
+
+    let r = roman
+        .ok(
+            "room_send",
+            json!({"room": "ios", "text": "there you are", "session": "s1"}),
+        )
+        .await;
+    assert_eq!(sessions(&r["present"]), vec!["alex/codex#s9"], "{r}");
+    assert!(r["present"][0]["idle_s"].as_i64().is_some(), "{r}");
+
+    // A session that has not touched the room for over 10 minutes is gone.
+    env.server.state.clock.advance(601);
+    let r = roman
+        .ok(
+            "room_send",
+            json!({"room": "ios", "text": "still there?", "session": "s1"}),
+        )
+        .await;
+    assert_eq!(r["present"], json!([]), "{r}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn s5d_ac_uc_agentslam_pair_from_session() {
+    let env = Env::start().await;
+    let (roman, alex) = env.ios_with_alex().await;
+    roman
+        .ok(
+            "room_send",
+            json!({"room": "ios", "text": "I am a", "session": "pair-a"}),
+        )
+        .await;
+    let b = roman
+        .ok(
+            "room_send",
+            json!({"room": "ios", "text": "I am b", "session": "pair-b"}),
+        )
+        .await;
+    assert_eq!(
+        sessions(&b["present"]),
+        vec!["roman/claude-pm#pair-a"],
+        "another session of the same agent is present: {b}"
+    );
+    alex.ok("room_send", json!({"room": "ios", "text": "plain"}))
+        .await;
+
+    let items = alex.ok("room_read", json!({"room": "ios"})).await;
+    let rows: Vec<(String, Value)> = items["messages"]
+        .as_array()
+        .or_else(|| items.as_array())
+        .expect("items")
+        .iter()
+        .filter(|m| m["kind"] == json!("message"))
+        .map(|m| {
+            (
+                m["text"].as_str().unwrap_or("").to_string(),
+                m["session"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("I am a".to_string(), json!("pair-a")),
+            ("I am b".to_string(), json!("pair-b")),
+            ("plain".to_string(), Value::Null),
+        ],
+        "{items}"
+    );
+}

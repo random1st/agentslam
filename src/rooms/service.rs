@@ -21,6 +21,11 @@ use crate::rooms::notify::Event;
 pub const MAX_TEXT_CHARS: usize = 16_000;
 pub const READ_LIMIT: i64 = 200;
 pub const MAX_WAIT_S: u64 = 50;
+/// An attached session counts as present in a room this long after it last
+/// sent, waited or attached there. Longer than the agent-online window
+/// (`people::PRESENCE_WINDOW_S`): a partner spends minutes on code between calls.
+pub const SESSION_PRESENCE_WINDOW_S: i64 = 600;
+const MAX_PRESENT: i64 = 20;
 /// At most this many distinct rooms per room_wait (each check reads up to
 /// READ_LIMIT items per room under the one database lock).
 pub const MAX_WAIT_ROOMS: usize = 50;
@@ -89,6 +94,19 @@ pub struct Message {
     pub at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<String>,
+    /// The session that wrote the item, when it was sent with one: tells two
+    /// sessions of one agent apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+}
+
+/// A session attached to a room that touched it within [`SESSION_PRESENCE_WINDOW_S`].
+#[derive(Debug, Serialize)]
+pub struct Presence {
+    pub from: String,
+    pub session: String,
+    /// Seconds since the session last sent, waited on or attached the room.
+    pub idle_s: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -208,7 +226,8 @@ pub fn expire_requests(conn: &Connection, now: i64) -> Result<()> {
 const ITEM_SELECT: &str = "SELECT m.seq, m.kind,
        CASE WHEN m.kind IN ('summary_request', 'join_request') THEN 'agentslam' ELSE p.handle || '/' || a.label END,
        m.text, m.created_at,
-       CASE WHEN m.kind IN ('summary_request', 'join_request') THEN p.handle || '/' || a.label END
+       CASE WHEN m.kind IN ('summary_request', 'join_request') THEN p.handle || '/' || a.label END,
+       m.session_key
      FROM messages m JOIN agents a ON a.id = m.agent_id JOIN persons p ON p.id = a.person_id";
 
 fn row_item(room: &Room, r: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
@@ -220,6 +239,7 @@ fn row_item(room: &Room, r: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         text: r.get(3)?,
         at: r.get(4)?,
         to: r.get(5)?,
+        session: r.get(6)?,
     })
 }
 
@@ -291,6 +311,59 @@ fn advance_cursor(
         params![agent_id, session_key, room_id, seq],
     )?;
     Ok(())
+}
+
+/// Mark the session as present in the room now.
+fn touch(
+    conn: &Connection,
+    agent_id: i64,
+    session_key: &str,
+    room_id: i64,
+    now: i64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE session_rooms SET last_seen_at = ?4
+         WHERE agent_id = ?1 AND session_key = ?2 AND room_id = ?3",
+        params![agent_id, session_key, room_id, now],
+    )?;
+    Ok(())
+}
+
+/// The other sessions present in the room (most recent first), so an agent
+/// knows whether anyone is listening before it waits for an answer.
+fn present(
+    conn: &Connection,
+    room_id: i64,
+    agent_id: i64,
+    session_key: &str,
+    now: i64,
+) -> Result<Vec<Presence>> {
+    let mut stmt = conn.prepare(
+        "SELECT p.handle || '/' || a.label, s.session_key, s.last_seen_at
+         FROM session_rooms s JOIN agents a ON a.id = s.agent_id JOIN persons p ON p.id = a.person_id
+         WHERE s.room_id = ?1 AND s.last_seen_at > ?4
+           AND NOT (s.agent_id = ?2 AND s.session_key = ?3)
+         ORDER BY s.last_seen_at DESC LIMIT ?5",
+    )?;
+    let rows = stmt
+        .query_map(
+            params![
+                room_id,
+                agent_id,
+                session_key,
+                now - SESSION_PRESENCE_WINDOW_S,
+                MAX_PRESENT
+            ],
+            |r| {
+                Ok(Presence {
+                    from: r.get(0)?,
+                    session: r.get(1)?,
+                    idle_s: now - r.get::<_, i64>(2)?,
+                })
+            },
+        )?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
 }
 
 fn publish_all(state: &Shared, events: Vec<Event>) {
@@ -560,6 +633,7 @@ pub async fn attach(
 ) -> Result<serde_json::Value> {
     let agent_id = caller.agent_id;
     let org_id = caller.org_id;
+    let now = state.clock.now();
     state
         .db
         .call(move |conn| {
@@ -583,7 +657,9 @@ pub async fn attach(
                 params![agent_id, session_key, r.id],
                 |row| row.get(0),
             )?;
-            Ok(serde_json::json!({"room": r.name, "attached": true, "cursor": cursor}))
+            touch(conn, agent_id, &session_key, r.id, now)?;
+            let present = present(conn, r.id, agent_id, &session_key, now)?;
+            Ok(serde_json::json!({"room": r.name, "attached": true, "cursor": cursor, "present": present}))
         })
         .await
 }
@@ -610,7 +686,7 @@ pub async fn detach(
 }
 
 pub async fn send(state: &Shared, caller: &Caller, room: String, text: String) -> Result<Message> {
-    post_item(state, caller, room, text, KIND_MESSAGE, MAX_TEXT_CHARS).await
+    post_item(state, caller, room, text, KIND_MESSAGE).await
 }
 
 /// `room_summarize` (B6a): any member posts the newest summary of the room.
@@ -620,7 +696,7 @@ pub async fn summarize(
     room: String,
     text: String,
 ) -> Result<Message> {
-    post_item(state, caller, room, text, KIND_SUMMARY, MAX_SUMMARY_CHARS).await
+    post_item(state, caller, room, text, KIND_SUMMARY).await
 }
 
 async fn post_item(
@@ -629,7 +705,6 @@ async fn post_item(
     room: String,
     text: String,
     kind: &'static str,
-    max_chars: usize,
 ) -> Result<Message> {
     let now = state.clock.now();
     let c = caller.clone();
@@ -637,7 +712,7 @@ async fn post_item(
         .db
         .call(move |conn| {
             let tx = conn.transaction()?;
-            let (r, msg) = insert_item(&tx, &c, &room, text, kind, max_chars, now)?;
+            let (r, msg) = insert_item(&tx, &c, &room, text, kind, None, now)?;
             tx.commit()?;
             Ok((r.id, msg))
         })
@@ -656,9 +731,14 @@ fn insert_item(
     room: &str,
     text: String,
     kind: &'static str,
-    max_chars: usize,
+    session: Option<&str>,
     now: i64,
 ) -> Result<(Room, Message)> {
+    let max_chars = if kind == KIND_SUMMARY {
+        MAX_SUMMARY_CHARS
+    } else {
+        MAX_TEXT_CHARS
+    };
     let (r, _) = require_member(tx, c.org_id, room, c.agent_id)?;
     if r.state == "archived" {
         return Err(Error::RoomArchived);
@@ -673,8 +753,8 @@ fn insert_item(
         params![r.id, seq],
     )?;
     tx.execute(
-        "INSERT INTO messages (room_id, seq, agent_id, text, created_at, kind) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![r.id, seq, c.agent_id, text, now, kind],
+        "INSERT INTO messages (room_id, seq, agent_id, text, created_at, kind, session_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![r.id, seq, c.agent_id, text, now, kind, session],
     )?;
     let msg = Message {
         kind: kind.to_string(),
@@ -684,6 +764,7 @@ fn insert_item(
         text,
         at: now,
         to: None,
+        session: session.map(str::to_string),
     };
     Ok((r, msg))
 }
@@ -701,6 +782,9 @@ pub struct SendResult {
     pub reply: Option<Vec<Message>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reply_timed_out: Option<bool>,
+    /// With a session: the other sessions present in the room.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub present: Option<Vec<Presence>>,
 }
 
 /// `room_send` with the pair loop (B6b): with a session the send also reads
@@ -725,6 +809,7 @@ pub async fn send_and_read(
             unread: None,
             reply: None,
             reply_timed_out: None,
+            present: None,
         });
     };
     let session = validate_session(&session)?;
@@ -737,7 +822,7 @@ pub async fn send_and_read(
     let now = state.clock.now();
     let c = caller.clone();
     let sk = session.clone();
-    let (room_id, message, unread) = state
+    let (room_id, message, unread, present) = state
         .db
         .call(move |conn| {
             let tx = conn.transaction()?;
@@ -748,15 +833,18 @@ pub async fn send_and_read(
                 |row| row.get(0),
             )?;
             let unread = member_items(&tx, &r, c.agent_id, adm, cursor, now)?;
-            let (r, message) = insert_item(&tx, &c, &room, text, KIND_MESSAGE, MAX_TEXT_CHARS, now)?;
+            let (r, message) =
+                insert_item(&tx, &c, &room, text, KIND_MESSAGE, Some(&sk), now)?;
             // A full page means more is left unread: move only past what was delivered.
             let upto = match unread.last() {
                 Some(last) if unread.len() as i64 >= READ_LIMIT => last.seq,
                 _ => message.seq,
             };
             advance_cursor(&tx, c.agent_id, &sk, r.id, upto)?;
+            touch(&tx, c.agent_id, &sk, r.id, now)?;
+            let present = present(&tx, r.id, c.agent_id, &sk, now)?;
             tx.commit()?;
-            Ok((r.id, message, unread))
+            Ok((r.id, message, unread, present))
         })
         .await?;
     state.hub.publish(Event::Message {
@@ -782,6 +870,7 @@ pub async fn send_and_read(
         unread: Some(unread),
         reply,
         reply_timed_out,
+        present: Some(present),
     })
 }
 
@@ -909,6 +998,9 @@ pub async fn wait(
                     let adm =
                         member_admission(&tx, *room_id, agent_id)?.ok_or(Error::NotAMember)?;
                     let msgs = member_items(&tx, &r, agent_id, adm, *cursor, now)?;
+                    if *attached {
+                        touch(&tx, agent_id, &sk, *room_id, now)?;
+                    }
                     if let (true, Some(last)) = (*attached, msgs.last()) {
                         advance_cursor(&tx, agent_id, &sk, *room_id, last.seq)?;
                     }
@@ -982,6 +1074,11 @@ pub async fn unread(
                 let Some(r) = room_by_id(&tx, org_id, room_id)? else { continue };
                 let Some(adm) = member_admission(&tx, room_id, agent_id)? else { continue };
                 let msgs = member_items(&tx, &r, agent_id, adm, cursor, now)?;
+                // The prompt hook (advance) means the session is working; the
+                // Stop hook (count only) fires when it goes idle: no touch.
+                if advance {
+                    touch(&tx, agent_id, &session_key, room_id, now)?;
+                }
                 if advance && let Some(last) = msgs.last() {
                     advance_cursor(&tx, agent_id, &session_key, room_id, last.seq)?;
                 }

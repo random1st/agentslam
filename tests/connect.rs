@@ -556,10 +556,70 @@ async fn s5d_ac_uc_agentslam_connect_refresh_rotation() {
         json!("roman/claude-pm")
     );
 
+    // Past the reuse grace the old token is theft: refused, and the grant dies.
+    env.server.state.clock.advance(301);
     let r = refresh(&env.base, &client, &old_refresh).await;
     assert_eq!(r.status(), 400);
     let body: Value = r.json().await.expect("json");
     assert_eq!(body["error"], json!("invalid_grant"));
+    let new_refresh = second["refresh_token"].as_str().expect("rt");
+    let r = refresh(&env.base, &client, new_refresh).await;
+    assert_eq!(r.status(), 400, "the whole grant is revoked");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn s5d_ac_uc_agentslam_connect_refresh_concurrent() {
+    let env = Env::start().await;
+    let client = env.cimd.client("claude.json");
+    let (verifier, challenge) = pkce();
+    let code = code_for_roman(&env, &challenge).await;
+    let first: Value = exchange_code(&env.base, &client, &code, &verifier, CLAUDE_REDIRECT)
+        .await
+        .json()
+        .await
+        .expect("json");
+    let shared = first["refresh_token"].as_str().expect("rt").to_string();
+
+    // Session one wins the refresh; session two presents the same token later.
+    let a: Value = refresh(&env.base, &client, &shared)
+        .await
+        .json()
+        .await
+        .expect("json");
+    env.server.state.clock.advance(200);
+    let r = refresh(&env.base, &client, &shared).await;
+    assert_eq!(
+        r.status(),
+        200,
+        "a reuse within the grace gets a sibling pair"
+    );
+    let b: Value = r.json().await.expect("json");
+    assert_ne!(a["refresh_token"], b["refresh_token"]);
+    for pair in [&a, &b] {
+        let mcp = Mcp::new(&env.base, pair["access_token"].as_str().expect("at"));
+        assert_eq!(
+            mcp.ok("room_list", json!({})).await["caller"],
+            json!("roman/claude-pm"),
+            "both sessions keep working"
+        );
+    }
+    let r = refresh(&env.base, &client, a["refresh_token"].as_str().expect("rt")).await;
+    assert_eq!(r.status(), 200, "the winner's refresh token is still valid");
+    let a2: Value = r.json().await.expect("json");
+
+    // The grace counts from the first rotation; a reuse does not restart it.
+    env.server.state.clock.advance(101);
+    let r = refresh(&env.base, &client, &shared).await;
+    assert_eq!(r.status(), 400);
+    let body: Value = r.json().await.expect("json");
+    assert_eq!(body["error"], json!("invalid_grant"));
+    let r = refresh(
+        &env.base,
+        &client,
+        a2["refresh_token"].as_str().expect("rt"),
+    )
+    .await;
+    assert_eq!(r.status(), 400, "a reuse past the grace revokes the grant");
 }
 
 #[tokio::test(flavor = "multi_thread")]

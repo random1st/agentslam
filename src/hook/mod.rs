@@ -118,9 +118,13 @@ pub fn format_messages(msgs: &[Message]) -> String {
                 esc(&m.text)
             ),
             _ => format!(
-                "<room-message room=\"{}\" from=\"{}\" seq=\"{}\" untrusted>\n{}\n</room-message>\n",
+                "<room-message room=\"{}\" from=\"{}\"{} seq=\"{}\" untrusted>\n{}\n</room-message>\n",
                 esc(&m.room),
                 esc(&m.from),
+                m.session
+                    .as_deref()
+                    .map(|s| format!(" session=\"{}\"", esc(s)))
+                    .unwrap_or_default(),
                 m.seq,
                 esc(&m.text)
             ),
@@ -219,6 +223,7 @@ mod tests {
             text: text.into(),
             at: 0,
             to: None,
+            session: None,
         }
     }
 
