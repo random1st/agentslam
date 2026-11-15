@@ -30,6 +30,9 @@ pub struct AppState {
     pub cimd: CimdCache,
     /// Outbound HTTP (IdP, CIMD): short timeouts, no redirects followed.
     pub http: reqwest::Client,
+    /// Per-process key that seals room_decide's MRTR requestState. A restart
+    /// voids open forms; the request stays pending and the agent asks again.
+    pub decide_key: [u8; 32],
 }
 
 pub type Shared = Arc<AppState>;
@@ -62,6 +65,7 @@ impl AppState {
             oidc: Oidc::new(allow_private_hosts),
             cimd: CimdCache::default(),
             http,
+            decide_key: rand::random(),
         }))
     }
 }

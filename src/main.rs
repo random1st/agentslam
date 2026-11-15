@@ -40,11 +40,40 @@ enum Command {
         )]
         config: PathBuf,
     },
+    /// Instance operator commands that run against the server database.
+    Admin {
+        #[command(subcommand)]
+        command: AdminCommand,
+    },
     /// Host hook: `session-start` (SessionStart: prints the agentslam session id),
     /// `prompt` (UserPromptSubmit) or `stop` (Stop, never blocks).
     Hook {
         #[arg(value_enum)]
         kind: HookArg,
+    },
+}
+
+#[derive(Subcommand)]
+enum AdminCommand {
+    /// Mint a headless token for agent <service>/<agent> of organization
+    /// <org>, creating the service account if missing. Prints only the token.
+    ServiceToken {
+        #[arg(
+            long,
+            short,
+            env = "AGENTSLAM_CONFIG",
+            default_value = "agentslam.toml"
+        )]
+        config: PathBuf,
+        /// Organization name or key (e.g. the Workspace domain).
+        #[arg(long)]
+        org: String,
+        /// Service account name.
+        #[arg(long)]
+        service: String,
+        /// Agent label.
+        #[arg(long)]
+        agent: String,
     },
 }
 
@@ -67,6 +96,24 @@ async fn main() -> ExitCode {
             };
             ExitCode::from(hook::run(kind).await as u8)
         }
+        Command::Admin {
+            command:
+                AdminCommand::ServiceToken {
+                    config,
+                    org,
+                    service,
+                    agent,
+                },
+        } => match service_token(&config, &org, &service, &agent).await {
+            Ok(token) => {
+                println!("{token}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                ExitCode::FAILURE
+            }
+        },
         Command::CheckConfig { config } => match Config::load(&config) {
             Ok(_) => {
                 println!("config ok: {}", config.display());
@@ -107,4 +154,36 @@ async fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
     }
+}
+
+/// `agentslam admin service-token`: open the configured database (applying
+/// pending migrations, as the server does) and mint the token.
+async fn service_token(
+    config: &std::path::Path,
+    org: &str,
+    service: &str,
+    agent: &str,
+) -> anyhow::Result<String> {
+    let cfg = Config::load(config)?;
+    // An operator command must act on the server's database: a mistyped path
+    // would otherwise create an empty database and mint a token nobody serves.
+    if !std::path::Path::new(&cfg.database).is_file() {
+        anyhow::bail!(
+            "database {} does not exist: point `database` in {} at the server's database",
+            cfg.database,
+            config.display()
+        );
+    }
+    let db = agentslam::core::db::Db::open(&cfg.database)?;
+    let now = agentslam::core::clock::Clock::default().now();
+    let resource = cfg.mcp_resource();
+    let (org, service, agent) = (org.to_string(), service.to_string(), agent.to_string());
+    let token = db
+        .call(move |c| {
+            agentslam::identity::people::operator_service_token(
+                c, &org, &service, &agent, &resource, now,
+            )
+        })
+        .await?;
+    Ok(token)
 }

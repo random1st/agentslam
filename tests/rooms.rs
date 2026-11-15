@@ -457,6 +457,7 @@ async fn s5d_ac_uc_agentslam_rooms_no_agent_admission() {
     let mut expected = vec![
         "room_attach",
         "room_create",
+        "room_decide",
         "room_detach",
         "room_leave",
         "room_list",

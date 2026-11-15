@@ -481,11 +481,19 @@ pub struct JoinOutcome {
 }
 
 /// Text of the `join_request` item sent to the owner's member agents (B5).
-/// The agent may only pass it on: the person decides in the web UI.
-pub fn join_request_text(agent: &str, room: &str, owner: &str, link: &str) -> String {
+/// The agent may only pass it on: the person decides, in the web UI or in
+/// the form that room_decide makes the agent's client show them.
+pub fn join_request_text(
+    agent: &str,
+    room: &str,
+    owner: &str,
+    link: &str,
+    request_id: i64,
+) -> String {
     format!(
-        "{agent} asks to join room {room}. You cannot let it in or turn it down, and you must not try: \
-         only your person ({owner}) decides, in the agentslam web UI. Tell them and give them this link: {link}"
+        "{agent} asks to join room {room} (request {request_id}). You cannot let it in or turn it down, and you must not try: \
+         only your person ({owner}) decides. Tell them and give them this link to the agentslam web UI: {link}. \
+         You may also call room_decide with room {room} and request_id {request_id}: your client then shows your person a form, and only their answer counts."
     )
 }
 
@@ -556,7 +564,7 @@ pub async fn request_join(state: &Shared, caller: &Caller, room: String) -> Resu
                         |row| row.get(0),
                     )?;
                     let link = format!("{base}/?room={}#requests", r.name);
-                    let text = join_request_text(&c.display(), &r.name, &owner, &link);
+                    let text = join_request_text(&c.display(), &r.name, &owner, &link, id);
                     let mut seqs = Vec::new();
                     for (i, agent) in owner_agents.into_iter().enumerate() {
                         let seq = r.last_seq + 1 + i as i64;
@@ -1110,6 +1118,77 @@ fn require_governor(conn: &Connection, who: Person, room: &str) -> Result<Room> 
             "only the room owner or an admin can do this".into(),
         ))
     }
+}
+
+/// What `room_decide` asks the person about: the pending request of `room`.
+pub struct DecideTarget {
+    /// The caller's person as the governor who applies the answer.
+    pub who: Person,
+    /// `<person>/<agent>` of the agent that asks to join.
+    pub requester: String,
+    /// Web UI link to the room's requests.
+    pub link: String,
+    /// The caller authenticated with an OAuth access token (an interactive
+    /// client a person signed in to) and its person is not a service
+    /// account. Only then is there a person to show the form to.
+    pub interactive: bool,
+}
+
+/// `room_decide` precheck (B5): the caller's agent is a member of the room,
+/// its person owns the room or is an organization admin, and the request is
+/// pending. Decides nothing: only the person's elicitation answer does.
+pub async fn decide_target(
+    state: &Shared,
+    caller: &Caller,
+    room: String,
+    request_id: i64,
+) -> Result<DecideTarget> {
+    let now = state.clock.now();
+    let c = caller.clone();
+    let base = state.config.issuer();
+    state
+        .db
+        .call(move |conn| {
+            expire_requests(conn, now)?;
+            let (r, _) = require_member(conn, c.org_id, &room, c.agent_id)?;
+            let is_admin = crate::identity::orgs::is_org_admin(conn, c.org_id, c.person_id)?;
+            let interactive: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM tokens t JOIN persons p ON p.id = ?2
+                   WHERE t.token_hash = ?1 AND t.kind = 'access' AND p.is_service = 0)",
+                params![c.token_hash, c.person_id],
+                |row| row.get(0),
+            )?;
+            let who = Person {
+                person_id: c.person_id,
+                org_id: c.org_id,
+                is_admin,
+            };
+            if r.owner_person_id != who.person_id && !is_admin {
+                return Err(Error::Forbidden(
+                    "only an agent of the room owner or of an admin can do this".into(),
+                ));
+            }
+            let req: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT p.handle || '/' || a.label, j.status FROM join_requests j
+                     JOIN agents a ON a.id = j.agent_id JOIN persons p ON p.id = a.person_id
+                     WHERE j.id = ?1 AND j.room_id = ?2",
+                    params![request_id, r.id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let (requester, status) = req.ok_or(Error::NotFound)?;
+            if status != "pending" {
+                return Err(Error::Conflict(format!("request is {status}")));
+            }
+            Ok(DecideTarget {
+                who,
+                requester,
+                link: format!("{base}/?room={}#requests", r.name),
+                interactive,
+            })
+        })
+        .await
 }
 
 pub async fn confirm_request(

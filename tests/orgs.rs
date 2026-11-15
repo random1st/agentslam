@@ -895,3 +895,328 @@ async fn operator_disables_an_organization() {
     assert_eq!(alice_web.get("/api/me").await.status(), 401);
     assert!(bob.ok("room_list", json!({})).await["rooms"].is_array());
 }
+
+/// s5d-ac:uc.agentslam.orgs/service-token-cli
+#[tokio::test]
+async fn s5d_ac_uc_agentslam_orgs_service_token_cli() {
+    let dir = std::env::temp_dir().join(format!("agentslam-cli-{}", rand_suffix()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let db = dir.join("agentslam.db");
+    let db_path = db.to_str().expect("utf-8 path").to_string();
+    let p = db_path.clone();
+    let env = Env::start_with(move |c| c.database = p).await;
+    let roman_agent = env.agent("roman", "claude-pm").await; // creates example.com
+    roman_agent
+        .ok(
+            "room_create",
+            json!({"name": "ios", "topic": "iOS release coordination"}),
+        )
+        .await;
+    let config = dir.join("agentslam.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "public_url = \"{}\"\ndatabase = \"{db_path}\"\nallow_insecure_http_for_tests = true\n\n\
+             [[providers]]\nid = \"google\"\nkind = \"google\"\nclient_id = \"cli-test\"\n\
+             client_secret_env = \"AGENTSLAM_CLI_TEST_SECRET\"\n",
+            env.base
+        ),
+    )
+    .expect("write config");
+    let run = || {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_agentslam"))
+            .args(["admin", "service-token", "--config"])
+            .arg(&config)
+            .args([
+                "--org",
+                "example.com",
+                "--service",
+                "pregmate-agents",
+                "--agent",
+                "operator",
+            ])
+            .env("AGENTSLAM_CLI_TEST_SECRET", "x")
+            .env_remove("AGENTSLAM_CONFIG")
+            .output()
+            .expect("run agentslam admin service-token");
+        assert!(
+            out.status.success(),
+            "exit {:?}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert_eq!(lines.len(), 1, "exactly one line: {stdout:?}");
+        assert!(stdout.ends_with('\n'));
+        lines[0].to_string()
+    };
+    let first = run();
+    let operator = Mcp::new(&env.base, &first);
+    let list = operator.ok("room_list", json!({})).await;
+    assert_eq!(list["caller"], json!("pregmate-agents/operator"));
+    let join = operator
+        .ok("room_request_join", json!({"room": "ios"}))
+        .await;
+    assert_eq!(join["status"], json!("pending"), "a service account waits");
+
+    let second = run();
+    assert_ne!(first, second, "a second run mints a new token");
+    let again = Mcp::new(&env.base, &second);
+    assert_eq!(
+        again.ok("room_list", json!({})).await["caller"],
+        json!("pregmate-agents/operator")
+    );
+    assert_eq!(
+        count(
+            &env,
+            "SELECT COUNT(*) FROM persons WHERE handle = 'pregmate-agents' AND is_service = 1"
+        )
+        .await,
+        1,
+        "the service account is created once"
+    );
+
+    // Refusals print nothing on stdout and fail: an unknown organization, a
+    // service name that a person already holds, a database path that does
+    // not exist (the command must not create an empty database).
+    let refuse = |config: &std::path::Path, org: &str, service: &str, why: &str| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_agentslam"))
+            .args(["admin", "service-token", "--config"])
+            .arg(config)
+            .args(["--org", org, "--service", service, "--agent", "a1"])
+            .env("AGENTSLAM_CLI_TEST_SECRET", "x")
+            .output()
+            .expect("run");
+        assert!(!out.status.success(), "{why}: must fail");
+        assert!(out.stdout.is_empty(), "{why}: no token on stdout");
+        String::from_utf8_lossy(&out.stderr).to_string()
+    };
+    refuse(&config, "nope.example", "s1", "unknown org");
+    let err = refuse(&config, "example.com", "roman", "a person's handle");
+    assert!(err.contains("already used"), "{err}");
+    let missing = dir.join("missing.db");
+    let bad_config = dir.join("missing.toml");
+    std::fs::write(
+        &bad_config,
+        std::fs::read_to_string(&config)
+            .expect("config")
+            .replace(&db_path, missing.to_str().expect("utf-8 path")),
+    )
+    .expect("write config");
+    let err = refuse(&bad_config, "example.com", "s1", "missing database");
+    assert!(err.contains("does not exist"), "{err}");
+    assert!(!missing.exists(), "no database is created");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// s5d-ac:uc.agentslam.orgs/decide-elicitation
+#[tokio::test]
+async fn s5d_ac_uc_agentslam_orgs_decide_elicitation() {
+    let env = Env::start().await;
+    // Only an interactive OAuth session has a person behind it to answer.
+    let roman = env.oauth_agent("roman", "claude-pm").await;
+    let alex = env.agent("alex", "codex").await;
+    roman
+        .ok(
+            "room_create",
+            json!({"name": "ios", "topic": "iOS release coordination"}),
+        )
+        .await;
+    let status = |m: &Mcp| {
+        let m = m.reconnect();
+        async move { m.room_status("ios").await.expect("ios")["status"].clone() }
+    };
+    let request = |alex: &Mcp| {
+        let alex = alex.reconnect();
+        async move {
+            let j = alex.ok("room_request_join", json!({"room": "ios"})).await;
+            assert_eq!(j["status"], json!("pending"));
+            j["request_id"].as_i64().expect("request_id")
+        }
+    };
+    let decide = |id: i64| json!({"room": "ios", "request_id": id});
+    let answer = |action: &str, choice: Option<&str>| {
+        let mut a = json!({"action": action});
+        if let Some(c) = choice {
+            a["content"] = json!({"decision": c});
+        }
+        json!({"decision": a})
+    };
+
+    // Run 1: the form, then "let in" admits alex.
+    let id = request(&alex).await;
+    let items = roman
+        .ok("room_read", json!({"room": "ios", "since": 0}))
+        .await;
+    let jr = items["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|m| m["kind"] == "join_request")
+        .expect("join_request item")
+        .clone();
+    assert!(
+        jr["text"]
+            .as_str()
+            .expect("text")
+            .contains(&format!("request_id {id}")),
+        "the item names the request for room_decide: {jr}"
+    );
+    let (http, body) = roman.call_2026("room_decide", decide(id), true, None).await;
+    assert_eq!(http, 200, "{body}");
+    let r = &body["result"];
+    assert_eq!(r["resultType"], json!("input_required"), "{body}");
+    let form = &r["inputRequests"]["decision"];
+    assert_eq!(form["method"], json!("elicitation/create"), "{body}");
+    assert!(
+        form["params"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("alex/codex wants to join room ios")
+    );
+    assert_eq!(
+        form["params"]["requestedSchema"]["properties"]["decision"]["enum"],
+        json!(["let in", "decline"])
+    );
+    let state = r["requestState"].clone();
+    assert_eq!(
+        status(&alex).await,
+        json!("pending"),
+        "the call decides nothing"
+    );
+
+    // An answer without a state this server sealed for this request, agent
+    // and token counts for nothing: a guessed state, a well-formed but
+    // unsigned one (a one-shot retry without a form), or the state issued to
+    // a headless token of the same agent. A dismissed form leaves it pending.
+    let forged = [
+        json!("decide:999"),
+        json!("9999999999.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        json!(format!(
+            "9999999999.{}",
+            state
+                .as_str()
+                .expect("state")
+                .split('.')
+                .nth(1)
+                .expect("tag")
+        )),
+    ];
+    for bad_state in forged {
+        let (_, b) = roman
+            .call_2026(
+                "room_decide",
+                decide(id),
+                true,
+                Some((answer("accept", Some("let in")), bad_state)),
+            )
+            .await;
+        assert_eq!(
+            b["result"]["structuredContent"]["status"],
+            json!("pending"),
+            "{b}"
+        );
+    }
+    let headless = env.agent("roman", "claude-pm").await;
+    let (_, b) = headless
+        .call_2026("room_decide", decide(id), true, None)
+        .await;
+    let p = &b["result"]["structuredContent"];
+    assert_eq!(p["status"], json!("pending"), "{b}");
+    assert!(
+        p["reason"].as_str().expect("reason").contains("headless"),
+        "{b}"
+    );
+    let (_, b) = headless
+        .call_2026(
+            "room_decide",
+            decide(id),
+            true,
+            Some((answer("accept", Some("let in")), state.clone())),
+        )
+        .await;
+    assert_eq!(b["result"]["structuredContent"]["status"], json!("pending"));
+    assert_eq!(status(&alex).await, json!("pending"));
+    for dismissed in [answer("cancel", None), answer("decline", None)] {
+        let (_, b) = roman
+            .call_2026(
+                "room_decide",
+                decide(id),
+                true,
+                Some((dismissed, state.clone())),
+            )
+            .await;
+        assert_eq!(b["result"]["structuredContent"]["status"], json!("pending"));
+    }
+    assert_eq!(status(&alex).await, json!("pending"));
+    let (_, b) = roman
+        .call_2026(
+            "room_decide",
+            decide(id),
+            true,
+            Some((answer("accept", Some("let in")), state.clone())),
+        )
+        .await;
+    assert_eq!(
+        b["result"]["structuredContent"]["status"],
+        json!("confirmed"),
+        "{b}"
+    );
+    assert_eq!(status(&alex).await, json!("member"));
+
+    // Run 2: the person chooses "decline": the request is rejected.
+    alex.ok("room_leave", json!({"room": "ios"})).await;
+    let id2 = request(&alex).await;
+    let (_, b) = roman
+        .call_2026("room_decide", decide(id2), true, None)
+        .await;
+    let state2 = b["result"]["requestState"].clone();
+    let (_, b) = roman
+        .call_2026(
+            "room_decide",
+            decide(id2),
+            true,
+            Some((answer("accept", Some("decline")), state2)),
+        )
+        .await;
+    assert_eq!(
+        b["result"]["structuredContent"]["status"],
+        json!("rejected"),
+        "{b}"
+    );
+    assert_eq!(status(&alex).await, json!("none"));
+
+    // Run 3: a client without form support (or on an older protocol) gets
+    // the web UI link; a decision in the tool arguments counts for nothing.
+    let id3 = request(&alex).await;
+    let (_, b) = roman
+        .call_2026("room_decide", decide(id3), false, None)
+        .await;
+    let pending = &b["result"]["structuredContent"];
+    assert_eq!(pending["status"], json!("pending"), "{b}");
+    assert!(
+        pending["link"]
+            .as_str()
+            .expect("link")
+            .contains("?room=ios")
+    );
+    let legacy = roman
+        .ok(
+            "room_decide",
+            json!({"room": "ios", "request_id": id3, "decision": "let in"}),
+        )
+        .await;
+    assert_eq!(legacy["status"], json!("pending"));
+    assert_eq!(status(&alex).await, json!("pending"));
+
+    // alex/codex cannot decide its own request: it is not a member.
+    assert_eq!(alex.err("room_decide", decide(id3)).await, "not_a_member");
+    let (_, b) = alex.call_2026("room_decide", decide(id3), true, None).await;
+    assert_eq!(
+        b["result"]["structuredContent"]["error"],
+        json!("not_a_member"),
+        "{b}"
+    );
+    assert_eq!(status(&alex).await, json!("pending"));
+}

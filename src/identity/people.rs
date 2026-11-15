@@ -302,6 +302,48 @@ pub fn service_account_id(conn: &Connection, org_id: i64, name: &str) -> Result<
     .ok_or(Error::NotFound)
 }
 
+/// B13a operator path (`agentslam admin service-token`): in the organization
+/// whose name or key is `org`, get or create the service account `service`
+/// and its agent `agent`, and mint a new headless token. Returns the raw
+/// token. A human of that name, an unknown, ambiguous or disabled
+/// organization is an error; nothing is created then.
+pub fn operator_service_token(
+    conn: &mut Connection,
+    org: &str,
+    service: &str,
+    agent: &str,
+    resource: &str,
+    now: i64,
+) -> Result<String> {
+    let tx = conn.transaction()?;
+    let orgs: Vec<(i64, bool)> = {
+        let mut s = tx.prepare(
+            "SELECT id, disabled_at IS NOT NULL FROM organizations WHERE name = ?1 OR key_value = ?1",
+        )?;
+        s.query_map([org], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    let org_id = match orgs.as_slice() {
+        [] => return Err(Error::BadRequest(format!("no organization named {org}"))),
+        [(_, true)] => return Err(Error::BadRequest(format!("organization {org} is disabled"))),
+        [(id, false)] => *id,
+        _ => {
+            return Err(Error::BadRequest(format!(
+                "{org} matches several organizations; use its exact name"
+            )));
+        }
+    };
+    let pid = match service_account_id(&tx, org_id, service) {
+        Ok(pid) => pid,
+        Err(Error::NotFound) => create_service_account(&tx, org_id, service, now)?,
+        Err(e) => return Err(e),
+    };
+    let agent_id = agent_get_or_create(&tx, pid, agent, now)?;
+    let (raw, _family) = crate::identity::tokens::mint_agent_token(&tx, agent_id, resource, now)?;
+    tx.commit()?;
+    Ok(raw)
+}
+
 /// Service accounts of `org_id` (id, name, created_at), by name.
 pub fn service_accounts(conn: &Connection, org_id: i64) -> Result<Vec<(i64, String, i64)>> {
     let mut stmt = conn.prepare(

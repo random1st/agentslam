@@ -434,6 +434,25 @@ impl Env {
         Mcp::new(&self.base, &token)
     }
 
+    /// `<handle>/<label>` agent signed in through OAuth (the Claude client):
+    /// an interactive access token, as Claude Code holds after /mcp.
+    pub async fn oauth_agent(&self, handle: &str, label: &str) -> Mcp {
+        let b = self.person(handle).await;
+        let (verifier, challenge) = pkce();
+        let client = self.cimd.client("claude.json");
+        let back = b
+            .authorize_and_consent(&client, CLAUDE_REDIRECT, &challenge, label)
+            .await;
+        let code = query_param(&back, "code").expect("code");
+        let resp = exchange_code(&self.base, &client, &code, &verifier, CLAUDE_REDIRECT).await;
+        assert_eq!(resp.status(), 200, "token exchange");
+        let tok: Value = resp.json().await.expect("json");
+        Mcp::new(
+            &self.base,
+            tok["access_token"].as_str().expect("access token"),
+        )
+    }
+
     /// roman/claude-pm owns ios; alex/codex is a confirmed member.
     pub async fn ios_with_alex(&self) -> (Mcp, Mcp) {
         let roman = self.agent("roman", "claude-pm").await;
@@ -915,6 +934,61 @@ impl Mcp {
             .as_str()
             .unwrap_or_default()
             .to_string()
+    }
+
+    /// tools/call on protocol 2026-07-28 (stateless, per-request `_meta`),
+    /// as Claude Code sends it; `elicitation` declares the form capability.
+    /// `retry` carries (`inputResponses`, `requestState`) of an MRTR retry.
+    /// Returns (HTTP status, JSON-RPC body).
+    pub async fn call_2026(
+        &self,
+        tool: &str,
+        args: Value,
+        elicitation: bool,
+        retry: Option<(Value, Value)>,
+    ) -> (u16, Value) {
+        let caps = if elicitation {
+            json!({"elicitation": {"form": {}}})
+        } else {
+            json!({})
+        };
+        let mut params = json!({
+            "name": tool,
+            "arguments": args,
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "1"},
+                "io.modelcontextprotocol/clientCapabilities": caps
+            }
+        });
+        if let Some((responses, state)) = retry {
+            params["inputResponses"] = responses;
+            params["requestState"] = state;
+        }
+        let resp = self
+            .client
+            .post(&self.url)
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "tools/call")
+            .header("mcp-name", tool)
+            .bearer_auth(&self.token)
+            .json(&json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": params}))
+            .send()
+            .await
+            .expect("mcp request");
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        let body = serde_json::from_str(&text)
+            .ok()
+            .or_else(|| {
+                text.lines()
+                    .filter_map(|l| l.strip_prefix("data:"))
+                    .filter_map(|d| serde_json::from_str::<Value>(d.trim()).ok())
+                    .find(|v| v.get("id").is_some())
+            })
+            .unwrap_or(Value::Null);
+        (status, body)
     }
 
     pub async fn room_status(&self, room: &str) -> Option<Value> {
