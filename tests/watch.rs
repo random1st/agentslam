@@ -43,6 +43,13 @@ async fn s5d_ac_uc_agentslam_watch_item_wakes_watch() {
 
     let mut stream = reqwest::get(&url).await.expect("open watch");
     assert_eq!(stream.status(), 200);
+    // A first byte at once, so proxies pass the headers without waiting for a keepalive.
+    assert!(
+        read_until(&mut stream, ": connected\n", Duration::from_secs(2))
+            .await
+            .is_some(),
+        "first line arrives immediately"
+    );
     assert!(
         read_until(&mut stream, "agentslam:", Duration::from_millis(600))
             .await
@@ -111,7 +118,7 @@ async fn s5d_ac_uc_agentslam_watch_bad_link_or_no_rooms() {
         .ok("room_detach", json!({"room": "ios", "session": "W"}))
         .await;
     let mut stream = reqwest::get(&url).await.expect("open");
-    let got = read_until(&mut stream, "\n", Duration::from_secs(5))
+    let got = read_until(&mut stream, "session W.", Duration::from_secs(5))
         .await
         .expect("reason line");
     assert!(

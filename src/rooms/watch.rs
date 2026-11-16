@@ -63,9 +63,14 @@ pub fn watch_url(state: &Shared, agent_id: i64, session: &str) -> String {
 }
 
 /// The command a host runs under its monitor. `grep` drops the keepalive
-/// lines so only notices become events.
+/// lines so only notices become events. The trailing echo always runs, so a
+/// stream cut by a restart or the network still ends with a line that tells
+/// the agent to start it again, instead of a bare non-zero exit.
 pub fn monitor_command(url: &str) -> String {
-    format!("curl -sN '{url}' | grep --line-buffered '^agentslam'")
+    format!(
+        "curl -sN '{url}' | grep --line-buffered '^agentslam'; \
+         echo 'agentslam: watch stream closed. Call room_wait with your session for anything missed, then start the watch again.'"
+    )
 }
 
 fn sig_valid(key: &[u8; 32], agent_id: i64, session: &str, sig: &str) -> bool {
@@ -168,6 +173,11 @@ async fn run(state: Shared, agent_id: i64, session: String, tx: mpsc::Sender<Str
     let mut events = state.hub.subscribe();
     let mut notified = HashMap::new();
     let mut rooms = Vec::new();
+    // First byte at once: proxies (Cloudflare) hold the response headers
+    // until body bytes flow, so without it the stream looked dead for 25 s.
+    if tx.send(": connected\n".into()).await.is_err() {
+        return;
+    }
     if !scan_and_report(
         &state,
         agent_id,
@@ -238,5 +248,6 @@ mod tests {
         let c = monitor_command("https://x/watch/1/S/ab");
         assert!(c.starts_with("curl -sN 'https://x/watch/1/S/ab'"));
         assert!(c.contains("grep --line-buffered '^agentslam'"));
+        assert!(c.ends_with("start the watch again.'"), "{c}");
     }
 }
