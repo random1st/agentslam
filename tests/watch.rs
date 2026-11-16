@@ -39,7 +39,7 @@ async fn s5d_ac_uc_agentslam_watch_item_wakes_watch() {
     let url = att["watch"]["url"].as_str().expect("watch url").to_string();
     let cmd = att["watch"]["command"].as_str().expect("watch command");
     assert!(
-        cmd.contains(&url) && cmd.contains("until curl -sN "),
+        cmd.contains(&url) && cmd.contains("until curl -sfN "),
         "{cmd}"
     );
     assert!(url.starts_with(&format!("{}/watch/", env.base)), "{url}");
@@ -108,13 +108,25 @@ async fn s5d_ac_uc_agentslam_watch_bad_link_or_no_rooms() {
     let url = att["watch"]["url"].as_str().expect("url").to_string();
 
     // Another session or agent in the path does not match the signature.
+    // Refused as a 200 with a reason line (the monitor retries HTTP errors).
+    let refused = |body: String| body.starts_with("agentslam: this watch link is not valid");
     let forged = url.replacen("/W/", "/X/", 1);
-    assert_eq!(reqwest::get(&forged).await.expect("get").status(), 404);
+    let r = reqwest::get(&forged).await.expect("get");
+    assert_eq!(r.status(), 200);
+    assert!(
+        refused(r.text().await.expect("body")),
+        "forged link refused"
+    );
     // Flip the last hex digit to a different one (a fixed "0" left 1 in 16 links intact).
     let last = if url.ends_with('0') { '1' } else { '0' };
     let tampered = format!("{}{last}", &url[..url.len() - 1]);
     assert_ne!(tampered, url);
-    assert_eq!(reqwest::get(&tampered).await.expect("get").status(), 404);
+    let r = reqwest::get(&tampered).await.expect("get");
+    assert_eq!(r.status(), 200);
+    assert!(
+        refused(r.text().await.expect("body")),
+        "tampered link refused"
+    );
 
     // After detaching, the stream says why and ends.
     roman

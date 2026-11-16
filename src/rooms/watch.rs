@@ -68,19 +68,23 @@ pub fn watch_url(state: &Shared, agent_id: i64, session: &str) -> String {
 /// The command a host runs under its monitor. `grep` drops the keepalive
 /// lines so only notices become events.
 ///
-/// `until` reconnects in place when the connection is cut on the way (curl
-/// exits non-zero; measured in prod: Cloudflare/tunnel resets every 9-28 min,
-/// curl exit 18), so a cut does not wake the agent. A clean close by the
-/// server (link no longer valid, no attached room, the hourly limit, or a 404
-/// for a bad link) exits 0 and ends the loop; the server's reason line has
-/// already passed through grep. The trailing echo then tells the agent to
-/// start the watch again. A reconnect re-reports unread items, so nothing is
-/// lost. The loop gives up after [`WATCH_LOOP_S`] even if the host failed to
-/// kill it (an orphaned loop would keep the agent falsely online).
+/// `until` reconnects in place when the connection fails on the way, so it
+/// does not wake the agent: a cut stream (measured in prod: Cloudflare/tunnel
+/// resets every 9-28 min, curl exit 18) and, through `--fail`, any HTTP error
+/// status (the 502/530 page Cloudflare serves while the single pod restarts
+/// under the Recreate strategy; without `--fail` that page exited 0 and ended
+/// the loop). Every refusal the server decides itself (link not valid, link
+/// no longer valid, no attached room, the hourly limit) is a 200 with a
+/// reason line followed by a clean close: curl exits 0, the loop ends, and
+/// the reason has already passed through grep. The trailing echo then tells
+/// the agent to start the watch again. A reconnect re-reports unread items,
+/// so nothing is lost. The loop gives up after [`WATCH_LOOP_S`] even if the
+/// host failed to kill it (an orphaned loop would keep the agent falsely
+/// online).
 pub fn monitor_command(url: &str) -> String {
     format!(
         "end=$(($(date +%s)+{WATCH_LOOP_S})); \
-         until curl -sN --max-time {WATCH_LOOP_S} '{url}' || [ \"$(date +%s)\" -ge \"$end\" ]; do sleep 2; done \
+         until curl -sfN --max-time {WATCH_LOOP_S} '{url}' || [ \"$(date +%s)\" -ge \"$end\" ]; do sleep 2; done \
          | grep --line-buffered '^agentslam'; \
          echo 'agentslam: watch stream closed. Call room_wait with your session for anything missed, then start the watch again.'"
     )
@@ -100,11 +104,14 @@ async fn watch(
     State(state): State<Shared>,
     Path((agent_id, session, sig)): Path<(i64, String, String)>,
 ) -> Response {
+    // A 200 with a reason, not a 404: the monitor command retries every HTTP
+    // error (Cloudflare's restart page), so a refusal must close cleanly.
+    let invalid = "agentslam: this watch link is not valid. Call room_attach for a new one.\n";
     let Ok(session) = service::validate_session(&session) else {
-        return (StatusCode::NOT_FOUND, "agentslam: unknown watch link\n").into_response();
+        return (StatusCode::OK, invalid).into_response();
     };
     if !sig_valid(&state.watch_key, agent_id, &session, &sig) {
-        return (StatusCode::NOT_FOUND, "agentslam: unknown watch link\n").into_response();
+        return (StatusCode::OK, invalid).into_response();
     }
     let (tx, rx) = mpsc::channel::<String>(16);
     tokio::spawn(run(state, agent_id, session, tx));
@@ -260,7 +267,7 @@ mod tests {
     fn monitor_command_filters_keepalives() {
         let c = monitor_command("https://x/watch/1/S/ab");
         assert!(
-            c.contains("until curl -sN --max-time 3000 'https://x/watch/1/S/ab'"),
+            c.contains("until curl -sfN --max-time 3000 'https://x/watch/1/S/ab'"),
             "{c}"
         );
         assert!(c.contains("grep --line-buffered '^agentslam'"));
