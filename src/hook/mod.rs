@@ -138,7 +138,9 @@ pub fn format_messages(msgs: &[Message]) -> String {
 pub fn session_start_context(session_id: &str) -> String {
     format!(
         "agentslam session: {session_id}\n\
-         Pass session=\"{session_id}\" to the agentslam tools room_attach, room_detach, room_wait and room_list.\n"
+         Pass session=\"{session_id}\" to the agentslam tools room_attach, room_detach, room_wait and room_list.\n\
+         After you attach a room, run `agentslam watch --session {session_id}` in the background (Bash run_in_background). \
+         It exits when a room item arrives and prints it: act on it, then start it again. While it runs you show online.\n"
     )
 }
 
@@ -184,6 +186,110 @@ async fn call(kind: HookKind, session_id: &str) -> anyhow::Result<String> {
                 })
                 .unwrap_or_default();
             Ok(format!("agentslam: {n} unread ({rooms})\n"))
+        }
+    }
+}
+
+/// One `/hook/wait` long poll. `Ok(None)` = timed out, poll again.
+async fn wait_once(
+    client: &reqwest::Client,
+    url: &str,
+    token: &str,
+    session_id: &str,
+) -> Result<Option<String>, WatchError> {
+    let resp = client
+        .post(format!("{url}/hook/wait"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({"session_id": session_id, "timeout_s": WATCH_POLL_S}))
+        .send()
+        .await
+        .map_err(|e| WatchError::Retry(e.to_string()))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(WatchError::Fatal(format!(
+            "server refused the token (HTTP {status}): mint a new one and set AGENTSLAM_TOKEN"
+        )));
+    }
+    if status.is_client_error() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(WatchError::Fatal(format!("HTTP {status}: {body}")));
+    }
+    if !status.is_success() {
+        return Err(WatchError::Retry(format!("HTTP {status}")));
+    }
+    let body: Value = resp
+        .json()
+        .await
+        .map_err(|e| WatchError::Retry(e.to_string()))?;
+    if body.get("rooms_attached").and_then(Value::as_bool) == Some(false) {
+        return Err(WatchError::Fatal(format!(
+            "no rooms attached to session {session_id}: call room_attach with this session, then start watch again"
+        )));
+    }
+    let msgs: Vec<Message> =
+        serde_json::from_value(body.get("messages").cloned().unwrap_or(Value::Null))
+            .map_err(|e| WatchError::Retry(format!("decode messages: {e}")))?;
+    if msgs.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(format_messages(&msgs)))
+}
+
+enum WatchError {
+    Retry(String),
+    Fatal(String),
+}
+
+/// Server-side wait per poll (the server caps it at 50 s).
+const WATCH_POLL_S: u64 = 45;
+
+/// `agentslam watch --session <id>`: block until the session's attached rooms
+/// have a new item, print the items (wrapped as untrusted data) and exit 0.
+/// Meant to run in the background (Claude Code: Bash `run_in_background`):
+/// its exit wakes the agent, which acts on the items and starts it again.
+/// While it runs the agent shows online. Network errors are retried with
+/// backoff; a refused token or no attached rooms exits 1 with the reason.
+pub async fn watch(session_id: &str) -> i32 {
+    let Ok(session_id) = validate_session(session_id.trim()) else {
+        eprintln!("agentslam watch: session is not 1..128 chars of [A-Za-z0-9._:-]");
+        return 1;
+    };
+    let (url, token) = match hook_settings() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("agentslam watch: {e:#}");
+            return 1;
+        }
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(WATCH_POLL_S + 20))
+        .connect_timeout(Duration::from_secs(10))
+        .user_agent(concat!("agentslam-watch/", env!("CARGO_PKG_VERSION")))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("agentslam watch: {e}");
+            return 1;
+        }
+    };
+    let mut backoff = Duration::from_secs(2);
+    loop {
+        match wait_once(&client, &url, &token, &session_id).await {
+            Ok(Some(out)) => {
+                print!("{out}");
+                return 0;
+            }
+            Ok(None) => backoff = Duration::from_secs(2),
+            Err(WatchError::Fatal(e)) => {
+                eprintln!("agentslam watch: {e}");
+                return 1;
+            }
+            Err(WatchError::Retry(e)) => {
+                eprintln!("agentslam watch: {e}; retrying in {}s", backoff.as_secs());
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(60));
+            }
         }
     }
 }

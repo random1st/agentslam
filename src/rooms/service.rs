@@ -506,7 +506,7 @@ pub async fn request_join(state: &Shared, caller: &Caller, room: String) -> Resu
     let now = state.clock.now();
     let c = caller.clone();
     let base = state.config.issuer();
-    let (room_id, out, admitted, notices) = state
+    let (room_id, out, admitted, notices, mail) = state
         .db
         .call(move |conn| {
             let tx = conn.transaction()?;
@@ -516,7 +516,7 @@ pub async fn request_join(state: &Shared, caller: &Caller, room: String) -> Resu
                 return Err(Error::RoomArchived);
             }
             if member_admission(&tx, r.id, c.agent_id)?.is_some() {
-                return Ok((r.id, JoinOutcome { room, status: "member".into(), request_id: None }, false, vec![]));
+                return Ok((r.id, JoinOutcome { room, status: "member".into(), request_id: None }, false, vec![], None));
             }
             // The owner's own agents, and agents of a person who joined through
             // an invite link (B5a), are admitted at once.
@@ -533,7 +533,7 @@ pub async fn request_join(state: &Shared, caller: &Caller, room: String) -> Resu
                     params![r.id, c.agent_id, now, c.person_id],
                 )?;
                 tx.commit()?;
-                return Ok((r.id, JoinOutcome { room, status: "member".into(), request_id: None }, true, vec![]));
+                return Ok((r.id, JoinOutcome { room, status: "member".into(), request_id: None }, true, vec![], None));
             }
             let pending: Option<i64> = tx
                 .query_row(
@@ -542,8 +542,8 @@ pub async fn request_join(state: &Shared, caller: &Caller, room: String) -> Resu
                     |row| row.get(0),
                 )
                 .optional()?;
-            let (id, notices) = match pending {
-                Some(id) => (id, vec![]),
+            let (id, notices, mail) = match pending {
+                Some(id) => (id, vec![], None),
                 None => {
                     tx.execute(
                         "INSERT INTO join_requests (room_id, agent_id, status, created_at) VALUES (?1, ?2, 'pending', ?3)",
@@ -578,11 +578,26 @@ pub async fn request_join(state: &Shared, caller: &Caller, room: String) -> Resu
                     if let Some(last) = seqs.last() {
                         tx.execute("UPDATE rooms SET last_seq = ?2 WHERE id = ?1", params![r.id, last])?;
                     }
-                    (id, seqs)
+                    // Most recently used sign-in that carries an address.
+                    let owner_email: Option<String> = tx
+                        .query_row(
+                            "SELECT email FROM identities WHERE person_id = ?1 AND email IS NOT NULL AND email != ''
+                             ORDER BY last_login_at DESC LIMIT 1",
+                            [r.owner_person_id],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    let mail = owner_email.map(|to| crate::core::mail::JoinNotice {
+                        to,
+                        agent: c.display(),
+                        room: r.name.clone(),
+                        link: link.clone(),
+                    });
+                    (id, seqs, mail)
                 }
             };
             tx.commit()?;
-            Ok((r.id, JoinOutcome { room, status: "pending".into(), request_id: Some(id) }, false, notices))
+            Ok((r.id, JoinOutcome { room, status: "pending".into(), request_id: Some(id) }, false, notices, mail))
         })
         .await?;
     let mut events = vec![Event::RoomChanged { room_id }];
@@ -598,6 +613,9 @@ pub async fn request_join(state: &Shared, caller: &Caller, room: String) -> Resu
             .map(|seq| Event::Message { room_id, seq }),
     );
     publish_all(state, events);
+    if let (Some(mailer), Some(n)) = (&state.mailer, mail) {
+        crate::core::mail::spawn_join_notice(mailer.clone(), n);
+    }
     Ok(out)
 }
 

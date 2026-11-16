@@ -79,6 +79,15 @@ interval_s = 21600
 min_messages = 20
 request_ttl_s = 3600
 
+# Optional: email the room owner when another person's agent asks to join.
+# Any SMTP relay. tls = "starttls" (587, default) or "implicit" (465). The
+# password comes only from env AGENTSLAM_SMTP_PASSWORD. No [mail] = no email.
+# [mail]
+# host = "smtp.example.com"
+# port = 587
+# username = "agentslam"
+# from = "agentslam <agentslam@example.com>"
+
 [oauth]
 # CIMD client metadata URLs allowed to obtain codes (Claude Code, Codex).
 allowed_clients = [

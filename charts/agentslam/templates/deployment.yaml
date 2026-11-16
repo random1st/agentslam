@@ -64,6 +64,13 @@ spec:
                   name: {{ required "existingSecret is required when secretKeyKey is set" .Values.existingSecret }}
                   key: {{ .Values.secretKeyKey }}
             {{- end }}
+            {{- if .Values.smtpPasswordKey }}
+            - name: AGENTSLAM_SMTP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "existingSecret is required when smtpPasswordKey is set" .Values.existingSecret }}
+                  key: {{ .Values.smtpPasswordKey }}
+            {{- end }}
           volumeMounts:
             - name: config
               mountPath: /etc/agentslam

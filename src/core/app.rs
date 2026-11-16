@@ -33,6 +33,8 @@ pub struct AppState {
     /// Per-process key that seals room_decide's MRTR requestState. A restart
     /// voids open forms; the request stays pending and the agent asks again.
     pub decide_key: [u8; 32],
+    /// Join request emails to room owners; None when `[mail]` is absent.
+    pub mailer: Option<Arc<crate::core::mail::Mailer>>,
 }
 
 pub type Shared = Arc<AppState>;
@@ -57,6 +59,12 @@ impl AppState {
             .build()
             .context("build HTTP client")?;
         let allow_private_hosts = config.allow_insecure_http_for_tests;
+        let mailer = match &config.mail {
+            Some(m) => Some(Arc::new(
+                crate::core::mail::Mailer::new(m).context("mail transport")?,
+            )),
+            None => None,
+        };
         Ok(Arc::new(AppState {
             config: Arc::new(config),
             db,
@@ -66,6 +74,7 @@ impl AppState {
             cimd: CimdCache::default(),
             http,
             decide_key: rand::random(),
+            mailer,
         }))
     }
 }

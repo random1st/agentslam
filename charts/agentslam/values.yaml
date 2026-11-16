@@ -79,6 +79,17 @@ allowedTenants: []
 # web UI. Without it, connecting an organization's Okta is refused.
 secretKeyKey: ""
 
+# Optional: email the room owner about a new join request (any SMTP relay).
+# Empty host = no email. tls: starttls (587) or implicit (465). The password
+# is read from smtpPasswordKey inside existingSecret, never from values.
+mail:
+  host: ""
+  port: 587
+  username: ""
+  from: ""
+  tls: starttls
+smtpPasswordKey: ""
+
 persistence:
   enabled: true
   size: 5Gi

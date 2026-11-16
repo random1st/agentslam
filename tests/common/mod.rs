@@ -351,6 +351,7 @@ impl Env {
             allowed_domains: vec![],
             allowed_tenants: vec![],
             secret_key: Some(TEST_SECRET_KEY),
+            mail: None,
         };
         customize(&mut config);
         config.validate().expect("test config valid");

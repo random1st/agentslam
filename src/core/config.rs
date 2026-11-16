@@ -49,6 +49,45 @@ pub struct Config {
     /// AGENTSLAM_SECRET_KEY (32 bytes, base64). Never in the file.
     #[serde(skip)]
     pub secret_key: Option<[u8; 32]>,
+    /// Outbound email (join request notices to room owners). None = no mail.
+    #[serde(default)]
+    pub mail: Option<MailConfig>,
+}
+
+/// SMTP relay for owner notices. The password comes only from env
+/// AGENTSLAM_SMTP_PASSWORD, never from the file.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MailConfig {
+    pub host: String,
+    #[serde(default = "default_smtp_port")]
+    pub port: u16,
+    /// SMTP user name. Empty = no authentication.
+    #[serde(default)]
+    pub username: String,
+    /// Sender, e.g. `agentslam@example.com` or `agentslam <agentslam@example.com>`.
+    pub from: String,
+    #[serde(default)]
+    pub tls: MailTls,
+    /// Resolved from AGENTSLAM_SMTP_PASSWORD at load time; never deserialized.
+    #[serde(skip)]
+    pub password: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MailTls {
+    /// STARTTLS upgrade (port 587). Required, never falls back to plain text.
+    #[default]
+    Starttls,
+    /// TLS from the first byte (port 465).
+    Implicit,
+    /// Plain text. Tests only (needs allow_insecure_http_for_tests).
+    None,
+}
+
+fn default_smtp_port() -> u16 {
+    587
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -280,6 +319,15 @@ impl Config {
             })?;
             self.secret_key = Some(key);
         }
+        if let Some(m) = &mut self.mail
+            && m.password.is_none()
+            && !m.username.is_empty()
+        {
+            m.password = Some(
+                std::env::var("AGENTSLAM_SMTP_PASSWORD")
+                    .context("mail.username is set but env var AGENTSLAM_SMTP_PASSWORD is not")?,
+            );
+        }
         for p in &mut self.providers {
             if p.client_secret.is_some() {
                 continue;
@@ -316,6 +364,16 @@ impl Config {
                 public.scheme() == "https" || self.allow_insecure_http_for_tests,
                 "bind {} is not loopback: agentslam must sit behind TLS termination, so public_url must be https",
                 self.bind
+            );
+        }
+        if let Some(m) = &self.mail {
+            ensure!(!m.host.is_empty(), "mail.host is empty");
+            m.from.parse::<lettre::message::Mailbox>().map_err(|e| {
+                anyhow::anyhow!("mail.from {:?} is not an email address: {e}", m.from)
+            })?;
+            ensure!(
+                m.tls != MailTls::None || self.allow_insecure_http_for_tests,
+                "mail.tls = \"none\" is for tests only: use starttls (587) or implicit (465)"
             );
         }
         let mut ids = HashSet::new();

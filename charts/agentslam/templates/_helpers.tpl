@@ -51,5 +51,13 @@ app.kubernetes.io/instance: {{ .Release.Name }}
   "allowed_domains" (.Values.allowedDomains | default list)
   "allowed_tenants" (.Values.allowedTenants | default list)
   "admins" .Values.admins -}}
+{{- if .Values.mail.host -}}
+{{- $_ := set $cfg "mail" (dict
+  "host" .Values.mail.host
+  "port" (int .Values.mail.port)
+  "username" (.Values.mail.username | default "")
+  "from" (required "mail.from is required when mail.host is set" .Values.mail.from)
+  "tls" .Values.mail.tls) -}}
+{{- end -}}
 {{- toToml $cfg -}}
 {{- end -}}
