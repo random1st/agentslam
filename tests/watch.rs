@@ -100,7 +100,10 @@ async fn s5d_ac_uc_agentslam_watch_bad_link_or_no_rooms() {
     // Another session or agent in the path does not match the signature.
     let forged = url.replacen("/W/", "/X/", 1);
     assert_eq!(reqwest::get(&forged).await.expect("get").status(), 404);
-    let tampered = format!("{}0", &url[..url.len() - 1]);
+    // Flip the last hex digit to a different one (a fixed "0" left 1 in 16 links intact).
+    let last = if url.ends_with('0') { '1' } else { '0' };
+    let tampered = format!("{}{last}", &url[..url.len() - 1]);
+    assert_ne!(tampered, url);
     assert_eq!(reqwest::get(&tampered).await.expect("get").status(), 404);
 
     // After detaching, the stream says why and ends.
