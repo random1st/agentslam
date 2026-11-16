@@ -38,7 +38,10 @@ async fn s5d_ac_uc_agentslam_watch_item_wakes_watch() {
         .await;
     let url = att["watch"]["url"].as_str().expect("watch url").to_string();
     let cmd = att["watch"]["command"].as_str().expect("watch command");
-    assert!(cmd.contains(&url) && cmd.starts_with("curl -sN "), "{cmd}");
+    assert!(
+        cmd.contains(&url) && cmd.contains("until curl -sN "),
+        "{cmd}"
+    );
     assert!(url.starts_with(&format!("{}/watch/", env.base)), "{url}");
 
     let mut stream = reqwest::get(&url).await.expect("open watch");
@@ -173,13 +176,18 @@ async fn monitor_command_prints_one_line_per_notice() {
         .as_str()
         .expect("command")
         .to_string();
+    // Own process group: the loop runs in a subshell, so killing sh alone
+    // would leave it reconnecting and holding the test's stderr.
     let mut child = tokio::process::Command::new("sh")
         .arg("-c")
         .arg(&cmd)
         .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
         .kill_on_drop(true)
         .spawn()
         .expect("spawn sh");
+    let pgid = child.id().expect("pid");
     let stdout = child.stdout.take().expect("stdout");
     let mut lines = tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(stdout));
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -194,5 +202,48 @@ async fn monitor_command_prints_one_line_per_notice() {
         line.starts_with("agentslam: new room items (1 in ios"),
         "{line}"
     );
+    let _ = std::process::Command::new("kill")
+        .args(["-TERM", "--", &format!("-{pgid}")])
+        .status();
     child.kill().await.ok();
+}
+
+/// The reconnect loop stops on a clean close by the server: a session with
+/// no attached room gets the reason line, the closing line, and the shell
+/// exits (no endless reconnect).
+#[tokio::test(flavor = "multi_thread")]
+async fn monitor_command_stops_on_clean_close() {
+    let env = Env::start().await;
+    let (roman, _alex) = env.ios_with_alex().await;
+    let att = roman
+        .ok("room_attach", json!({"room": "ios", "session": "W"}))
+        .await;
+    let cmd = att["watch"]["command"]
+        .as_str()
+        .expect("command")
+        .to_string();
+    roman
+        .ok("room_detach", json!({"room": "ios", "session": "W"}))
+        .await;
+    let out = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .output(),
+    )
+    .await
+    .expect("the loop ends on a clean close")
+    .expect("run sh");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "reason + closing line only: {text}");
+    assert!(
+        lines[0].starts_with("agentslam: no rooms attached to session W"),
+        "{text}"
+    );
+    assert!(
+        lines[1].starts_with("agentslam: watch stream closed."),
+        "{text}"
+    );
 }

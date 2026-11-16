@@ -37,6 +37,9 @@ use crate::rooms::service::{self, WatchScan};
 pub const KEEPALIVE_S: u64 = 25;
 /// The server ends a stream after this long; the monitor is started again.
 pub const MAX_STREAM_S: u64 = 3600;
+/// Lifetime of the reconnect loop in the monitor command: above the 30 min
+/// Monitor limit, so the host normally ends it first.
+pub const WATCH_LOOP_S: u64 = 3000;
 
 pub fn routes() -> Router<Shared> {
     Router::new().route("/watch/{agent_id}/{session}/{sig}", get(watch))
@@ -63,12 +66,22 @@ pub fn watch_url(state: &Shared, agent_id: i64, session: &str) -> String {
 }
 
 /// The command a host runs under its monitor. `grep` drops the keepalive
-/// lines so only notices become events. The trailing echo always runs, so a
-/// stream cut by a restart or the network still ends with a line that tells
-/// the agent to start it again, instead of a bare non-zero exit.
+/// lines so only notices become events.
+///
+/// `until` reconnects in place when the connection is cut on the way (curl
+/// exits non-zero; measured in prod: Cloudflare/tunnel resets every 9-28 min,
+/// curl exit 18), so a cut does not wake the agent. A clean close by the
+/// server (link no longer valid, no attached room, the hourly limit, or a 404
+/// for a bad link) exits 0 and ends the loop; the server's reason line has
+/// already passed through grep. The trailing echo then tells the agent to
+/// start the watch again. A reconnect re-reports unread items, so nothing is
+/// lost. The loop gives up after [`WATCH_LOOP_S`] even if the host failed to
+/// kill it (an orphaned loop would keep the agent falsely online).
 pub fn monitor_command(url: &str) -> String {
     format!(
-        "curl -sN '{url}' | grep --line-buffered '^agentslam'; \
+        "end=$(($(date +%s)+{WATCH_LOOP_S})); \
+         until curl -sN --max-time {WATCH_LOOP_S} '{url}' || [ \"$(date +%s)\" -ge \"$end\" ]; do sleep 2; done \
+         | grep --line-buffered '^agentslam'; \
          echo 'agentslam: watch stream closed. Call room_wait with your session for anything missed, then start the watch again.'"
     )
 }
@@ -246,7 +259,10 @@ mod tests {
     #[test]
     fn monitor_command_filters_keepalives() {
         let c = monitor_command("https://x/watch/1/S/ab");
-        assert!(c.starts_with("curl -sN 'https://x/watch/1/S/ab'"));
+        assert!(
+            c.contains("until curl -sN --max-time 3000 'https://x/watch/1/S/ab'"),
+            "{c}"
+        );
         assert!(c.contains("grep --line-buffered '^agentslam'"));
         assert!(c.ends_with("start the watch again.'"), "{c}");
     }
