@@ -660,7 +660,13 @@ pub async fn attach(
     let agent_id = caller.agent_id;
     let org_id = caller.org_id;
     let now = state.clock.now();
-    state
+    let url = crate::rooms::watch::watch_url(state, agent_id, &session_key);
+    let watch = serde_json::json!({
+        "url": url,
+        "command": crate::rooms::watch::monitor_command(&url),
+        "how": "Run this command with your Monitor tool now (it streams; each line it prints is a notice that new room items arrived). On a notice, call room_wait with your session to read them. When the monitor ends, start it again. Without a Monitor tool, check the room with room_wait every few minutes instead.",
+    });
+    let mut v = state
         .db
         .call(move |conn| {
             let (r, adm) = require_member(conn, org_id, &room, agent_id)?;
@@ -687,7 +693,9 @@ pub async fn attach(
             let present = present(conn, r.id, agent_id, &session_key, now)?;
             Ok(serde_json::json!({"room": r.name, "attached": true, "cursor": cursor, "present": present}))
         })
-        .await
+        .await?;
+    v["watch"] = watch;
+    Ok(v)
 }
 
 pub async fn detach(
@@ -1070,6 +1078,92 @@ pub async fn wait(
             }
         }
     }
+}
+
+// ---------------------------------------------------------------- watch stream support
+
+/// What the watch stream of one (agent, session) sees right now.
+pub enum WatchScan {
+    /// The agent has no live token (signed out, revoked) or its organization
+    /// is disabled: the link is dead.
+    Gone,
+    /// The session has no attached room the agent is still a member of.
+    NoRooms,
+    /// Attached rooms (id, name) and the items newer than `notified` per room:
+    /// (room name, new count, highest seq). Unread totals per room too.
+    Rooms {
+        room_ids: Vec<i64>,
+        fresh: Vec<(i64, String, usize, i64)>,
+        unread_total: usize,
+    },
+}
+
+/// Scan for the watch stream. Reads only: cursors move when the agent reads
+/// with room_wait. `touch_presence` marks the agent and the session present.
+pub fn watch_scan(
+    conn: &Connection,
+    agent_id: i64,
+    session_key: &str,
+    notified: &HashMap<i64, i64>,
+    now: i64,
+    touch_presence: bool,
+) -> Result<WatchScan> {
+    let org: Option<i64> = conn
+        .query_row(
+            "SELECT p.org_id FROM agents a JOIN persons p ON p.id = a.person_id
+             JOIN organizations o ON o.id = p.org_id AND o.disabled_at IS NULL
+             WHERE a.id = ?1 AND EXISTS (
+               SELECT 1 FROM tokens t WHERE t.agent_id = a.id AND t.revoked_at IS NULL
+                 AND (t.expires_at IS NULL OR t.expires_at > ?2))",
+            params![agent_id, now],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(org_id) = org else {
+        return Ok(WatchScan::Gone);
+    };
+    let attached: Vec<(i64, i64)> = {
+        let mut stmt = conn.prepare(
+            "SELECT room_id, cursor FROM session_rooms WHERE agent_id = ?1 AND session_key = ?2 ORDER BY room_id",
+        )?;
+        stmt.query_map(params![agent_id, session_key], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?
+    };
+    let mut room_ids = Vec::new();
+    let mut fresh = Vec::new();
+    let mut unread_total = 0;
+    for (room_id, cursor) in attached {
+        let Some(r) = room_by_id(conn, org_id, room_id)? else {
+            continue;
+        };
+        let Some(adm) = member_admission(conn, room_id, agent_id)? else {
+            continue;
+        };
+        room_ids.push(room_id);
+        let items = member_items(conn, &r, agent_id, adm, cursor, now)?;
+        unread_total += items.len();
+        let seen = notified.get(&room_id).copied().unwrap_or(i64::MIN);
+        let new: Vec<&Message> = items.iter().filter(|m| m.seq > seen).collect();
+        if let Some(last) = new.last() {
+            fresh.push((room_id, r.name.clone(), new.len(), last.seq));
+        }
+        if touch_presence {
+            touch(conn, agent_id, session_key, room_id, now)?;
+        }
+    }
+    if room_ids.is_empty() {
+        return Ok(WatchScan::NoRooms);
+    }
+    if touch_presence {
+        crate::identity::people::touch_agent(conn, agent_id, now)?;
+    }
+    Ok(WatchScan::Rooms {
+        room_ids,
+        fresh,
+        unread_total,
+    })
 }
 
 // ---------------------------------------------------------------- hook support

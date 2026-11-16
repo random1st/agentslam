@@ -51,13 +51,6 @@ enum Command {
         #[arg(value_enum)]
         kind: HookArg,
     },
-    /// Block until the session's attached rooms have a new item, print it and
-    /// exit 0. Run it in the background; start it again after each exit.
-    Watch {
-        /// agentslam session id (the one passed as `session` to room_attach).
-        #[arg(long, env = "AGENTSLAM_SESSION")]
-        session: String,
-    },
 }
 
 #[derive(Subcommand)]
@@ -103,7 +96,6 @@ async fn main() -> ExitCode {
             };
             ExitCode::from(hook::run(kind).await as u8)
         }
-        Command::Watch { session } => ExitCode::from(hook::watch(&session).await as u8),
         Command::Admin {
             command:
                 AdminCommand::ServiceToken {

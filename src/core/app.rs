@@ -35,6 +35,8 @@ pub struct AppState {
     pub decide_key: [u8; 32],
     /// Join request emails to room owners; None when `[mail]` is absent.
     pub mailer: Option<Arc<crate::core::mail::Mailer>>,
+    /// Signs watch links. Kept in the database so links survive a restart.
+    pub watch_key: [u8; 32],
 }
 
 pub type Shared = Arc<AppState>;
@@ -51,6 +53,9 @@ impl AppState {
         if moved > 0 {
             tracing::info!(people = moved, "assigned existing people to organizations");
         }
+        let watch_key = db
+            .blocking(move |c| server_key(c, "watch", now))
+            .map_err(|e| anyhow::anyhow!("watch key: {e}"))?;
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .connect_timeout(Duration::from_secs(5))
@@ -75,8 +80,28 @@ impl AppState {
             http,
             decide_key: rand::random(),
             mailer,
+            watch_key,
         }))
     }
+}
+
+/// A named random key, created on first use and kept in `server_keys`.
+fn server_key(conn: &rusqlite::Connection, name: &str, now: i64) -> crate::core::Result<[u8; 32]> {
+    use rusqlite::OptionalExtension;
+    let existing: Option<Vec<u8>> = conn
+        .query_row("SELECT key FROM server_keys WHERE name = ?1", [name], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    if let Some(k) = existing.and_then(|k| <[u8; 32]>::try_from(k).ok()) {
+        return Ok(k);
+    }
+    let key: [u8; 32] = rand::random();
+    conn.execute(
+        "INSERT OR REPLACE INTO server_keys (name, key, created_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![name, key.to_vec(), now],
+    )?;
+    Ok(key)
 }
 
 fn allowed_hosts(config: &Config) -> Vec<String> {
@@ -121,6 +146,7 @@ pub fn router(state: Shared) -> Router {
         .merge(crate::identity::routes())
         .merge(crate::web::routes())
         .merge(crate::hook::api::routes())
+        .merge(crate::rooms::watch::routes())
         .merge(mcp)
         .with_state(state)
 }
